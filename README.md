@@ -81,8 +81,8 @@ permanence sous le compte système, et sa pauvreté est délibérée.
 ### Accès pré-connexion
 
 Par défaut le travailleur prend l'identité de l'utilisateur connecté : moindre
-privilège, mais il ne peut pas capturer l'écran de verrouillage, qui appartient
-au bureau `Winlogon` de Winlogon.
+privilège, mais il ne peut pas capturer l'écran de verrouillage : ce bureau
+appartient à Winlogon et son descripteur de sécurité l'en exclut.
 
 Pour un écran verrouillé, il faut que le travailleur tourne en SYSTEM dans la
 session interactive :
