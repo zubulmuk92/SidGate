@@ -1,0 +1,32 @@
+# Terminaison TLS du nœud sentinelle.
+#
+# Caddy obtient et renouvelle seul un certificat Let's Encrypt : c'est ce qui
+# fait disparaître l'avertissement de certificat auto-signé de l'agent, sans
+# qu'aucun secret ne transite par un tiers.
+
+{
+	# Aucune administration exposée : l'API d'admin de Caddy ouvrirait un
+	# chemin de reconfiguration à distance sur un hôte que l'on veut inerte.
+	admin off
+	email {$SIDGATE_ADMIN_EMAIL:admin@localhost}
+}
+
+{$SIDGATE_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Coordination du maillage. C'est le seul service joignable depuis
+	# l'Internet public, et il n'accepte que des clients porteurs d'une clé.
+	reverse_proxy headscale:8080
+
+	log {
+		output stdout
+		format console
+	}
+}

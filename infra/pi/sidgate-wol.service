@@ -1,0 +1,43 @@
+# Micro-service de réveil sidgate.
+#
+#   sudo cp sidgate-wol.service /etc/systemd/system/
+#   sudo systemctl enable --now sidgate-wol
+
+[Unit]
+Description=Service de réveil Wake-on-LAN sidgate
+Documentation=https://github.com/zubulmuk92/SidGate
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/sidgate-wol /etc/sidgate/wol.toml
+Restart=on-failure
+RestartSec=5
+
+# Le service n'a besoin que d'émettre un paquet de broadcast. Tout le reste lui
+# est retiré : un compromis ne donnerait accès à rien d'autre.
+User=sidgate-wol
+Group=sidgate-wol
+AmbientCapabilities=CAP_NET_BROADCAST
+CapabilityBoundingSet=CAP_NET_BROADCAST
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ReadOnlyPaths=/etc/sidgate
+
+[Install]
+WantedBy=multi-user.target

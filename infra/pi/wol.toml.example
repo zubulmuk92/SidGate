@@ -1,0 +1,23 @@
+# Configuration du micro-service de réveil.
+#
+#   sudo install -d -m 0750 /etc/sidgate
+#   sudo cp wol.toml.example /etc/sidgate/wol.toml
+#   sudo chmod 0640 /etc/sidgate/wol.toml
+#
+# Le jeton se génère par :  openssl rand -base64 32
+
+# Adresse de l'interface WireGuard du Pi. Jamais 0.0.0.0 : le service refuse
+# de démarrer si on lui demande d'écouter partout.
+listen = "100.64.0.1"
+port = 9797
+
+# Broadcast du réseau local, à adapter au plan d'adressage.
+broadcast = "192.168.1.255"
+
+token = "remplacer-par-un-jeton-aleatoire-de-32-octets"
+
+# Les machines réveillables sont déclarées ici, et nulle part ailleurs : le
+# client ne peut choisir qu'un nom de cette liste.
+[[hosts]]
+name = "station"
+mac = "aa:bb:cc:dd:ee:ff"

@@ -1,0 +1,61 @@
+# Nœud sentinelle sidgate : coordination du maillage WireGuard et terminaison
+# TLS, sur un Raspberry Pi allumé en permanence.
+#
+# Rien n'est publié sur l'interface physique : Headscale n'écoute que derrière
+# Caddy, et Caddy n'accepte que ce que nftables laisse passer. Voir nftables.conf.
+
+services:
+  headscale:
+    image: headscale/headscale:0.26
+    container_name: sidgate-headscale
+    restart: unless-stopped
+    command: serve
+    volumes:
+      - ./headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - headscale-data:/var/lib/headscale
+    # Aucun port publié : seul Caddy, sur le réseau interne, atteint Headscale.
+    expose:
+      - "8080"
+      - "9090"
+    networks:
+      - sentinelle
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: sidgate-caddy
+    restart: unless-stopped
+    depends_on:
+      - headscale
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      # Renseigné par le fichier .env voisin.
+      SIDGATE_DOMAIN: ${SIDGATE_DOMAIN}
+    networks:
+      - sentinelle
+
+  duckdns:
+    image: lscr.io/linuxserver/duckdns:latest
+    container_name: sidgate-duckdns
+    restart: unless-stopped
+    environment:
+      SUBDOMAINS: ${DUCKDNS_SUBDOMAIN}
+      TOKEN: ${DUCKDNS_TOKEN}
+      LOG_FILE: "false"
+    networks:
+      - sentinelle
+
+volumes:
+  headscale-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  sentinelle:
+    driver: bridge

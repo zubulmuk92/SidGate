@@ -1,0 +1,29 @@
+[package]
+name = "sidgate-wol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "AGPL-3.0-only"
+repository = "https://github.com/zubulmuk92/SidGate"
+description = "Micro-service de réveil par Wake-on-LAN du nœud sentinelle sidgate"
+
+# Espace de travail indépendant : l'agent est spécifique à Windows, ce service
+# tourne sur le Raspberry Pi. Les deux ne se compilent jamais ensemble.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,53 @@
+# Coordination du maillage WireGuard.
+#
+# Headscale ne voit passer aucun trafic : il distribue les clés publiques et les
+# adresses, puis les pairs se parlent directement. Le compromettre exposerait la
+# topologie du réseau, jamais le contenu des sessions.
+
+server_url: https://SIDGATE_DOMAIN
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 127.0.0.1:9090
+
+# Plage privée du maillage. Le 100.64.0.0/10 est réservé aux réseaux d'opérateur
+# (RFC 6598) : il n'entre en conflit avec aucun réseau domestique.
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+
+# Aucun relais de secours : le trafic passe en direct ou ne passe pas. Un relais
+# public verrait transiter les paquets chiffrés du tunnel, ce qui reste une
+# fuite de métadonnées que ce projet refuse.
+derp:
+  server:
+    enabled: false
+  urls: []
+  paths: []
+  auto_update_enabled: false
+
+disable_check_updates: true
+ephemeral_node_inactivity_timeout: 30m
+
+dns:
+  magic_dns: true
+  base_domain: sidgate.internal
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 9.9.9.9
+
+log:
+  level: info
+  format: text
+
+# Les clés de nœud expirent : un appareil perdu cesse de lui-même d'avoir accès,
+# même si la révocation manuelle n'a pas été faite.
+node_update_check_interval: 10s
