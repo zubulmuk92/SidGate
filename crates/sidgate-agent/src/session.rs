@@ -25,8 +25,8 @@ use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::peer_connection::{
     MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-    RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer, RTCPeerConnectionEvent,
-    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription,
+    RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer, RTCPeerConnectionIceEvent,
+    RTCPeerConnectionState, RTCSessionDescription,
 };
 
 use sidgate_encode::EncodedFrame;
@@ -340,9 +340,6 @@ pub fn is_terminal(state: RTCPeerConnectionState) -> bool {
 pub fn is_connected(state: RTCPeerConnectionState) -> bool {
     matches!(state, RTCPeerConnectionState::Connected)
 }
-
-#[allow(dead_code)]
-fn assert_event_type(_: &RTCPeerConnectionEvent) {}
 
 #[cfg(test)]
 mod tests {

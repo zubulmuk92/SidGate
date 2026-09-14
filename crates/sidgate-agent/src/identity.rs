@@ -23,7 +23,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey as AgentVerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature as ClientSignature, VerifyingKey as ClientVerifyingKey};
 use rand::TryRngCore;
@@ -411,11 +411,6 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Clé publique de l'agent, reconstruite depuis sa clé privée.
-pub fn verifying_key(signing_key: &SigningKey) -> AgentVerifyingKey {
-    signing_key.verifying_key()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,7 +773,7 @@ mod tests {
             identity.sign_agent_transcript(&SERVER_NONCE, &CLIENT_NONCE, &client_key);
 
         let public = signaling::from_hex_exact::<32>(&identity.public_key_hex()).unwrap();
-        let verifying = AgentVerifyingKey::from_bytes(&public).unwrap();
+        let verifying = ed25519_dalek::VerifyingKey::from_bytes(&public).unwrap();
         let signature = ed25519_dalek::Signature::from_slice(
             &signaling::from_hex(&signature_hex).unwrap(),
         )

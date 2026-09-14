@@ -51,6 +51,11 @@ pub struct PipelineStats {
     pub encoded: AtomicU64,
     /// Images abandonnées, encodeur saturé ou file pleine.
     pub dropped: AtomicU64,
+    /// Images effectivement confiées à l'encodeur.
+    ///
+    /// Distinct de `captured` : la cadence est plafonnée, et une image en
+    /// avance sur l'intervalle demandé est abandonnée avant conversion.
+    pub submitted: AtomicU64,
     /// Cycles terminés sans nouvelle image.
     pub idle: AtomicU64,
     /// Octets compressés produits.
@@ -170,6 +175,11 @@ fn run(
 
     let start = Instant::now();
     let mut encoded = Vec::with_capacity(4);
+    // Intervalle minimal entre deux soumissions. Le compositeur peut presenter
+    // bien plus vite que la cadence demandee ; convertir puis jeter ces images
+    // couterait du GPU et du CPU pour rien.
+    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(video.framerate.max(1)));
+    let mut last_submit = Instant::now() - frame_interval;
 
     loop {
         match drain_commands(&commands, &mut engine) {
@@ -177,23 +187,41 @@ fn run(
             ControlFlow::Stop => break,
         }
 
-        let mark = Instant::now();
         match engine.capturer.acquire(ACQUIRE_TIMEOUT) {
             Ok(FrameStatus::Ready { .. }) => {
                 stats.captured.fetch_add(1, Ordering::Relaxed);
-                match engine.encoder.submit(start.elapsed(), &mut encoded) {
-                    Ok(Submission::Accepted) => {}
-                    Ok(Submission::Busy) => {
-                        stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "encodage interrompu");
+
+                if last_submit.elapsed() < frame_interval {
+                    // Image en avance sur la cadence demandee : on la laisse
+                    // tomber tout de suite plutot que de payer la conversion.
+                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    if let Err(e) = engine.encoder.poll(&mut encoded) {
+                        tracing::error!(error = %e, "drainage de l'encodeur interrompu");
                         break;
                     }
+                } else {
+                    // Le chronometre demarre ici, et non avant l'acquisition :
+                    // y inclure l'attente d'une nouvelle image ferait passer un
+                    // bureau immobile pour un encodeur lent.
+                    let mark = Instant::now();
+                    match submit_within(&mut engine, start.elapsed(), &mut encoded, frame_interval)
+                    {
+                        Ok(Submission::Accepted) => {
+                            last_submit = Instant::now();
+                            stats.submitted.fetch_add(1, Ordering::Relaxed);
+                            stats
+                                .encode_us
+                                .fetch_add(mark.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                        Ok(Submission::Busy) => {
+                            stats.dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "encodage interrompu");
+                            break;
+                        }
+                    }
                 }
-                stats
-                    .encode_us
-                    .fetch_add(mark.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             Ok(FrameStatus::Idle) => {
                 stats.idle.fetch_add(1, Ordering::Relaxed);
@@ -240,6 +268,37 @@ fn run(
                     return;
                 }
             }
+        }
+    }
+}
+
+/// Soumet une image en laissant a l'encodeur le temps de reclamer une entree.
+///
+/// Un encodeur materiel asynchrone signale sa disponibilite par evenement. Un
+/// unique sondage non bloquant au moment ou l'image arrive est un tirage au
+/// sort : si l'evenement n'est pas encore dans la file, l'image est perdue
+/// alors que l'ASIC etait libre un dixieme de milliseconde plus tard.
+///
+/// On reessaie donc jusqu'a l'echeance de la cadence. Attendre jusque-la ne
+/// coute aucune latence : sans cela on ne ferait qu'attendre l'image suivante.
+/// Au-dela de l'echeance, l'encodeur est reellement sature et l'image part a la
+/// poubelle, ce qui reste le bon choix en direct.
+fn submit_within(
+    engine: &mut Engine,
+    timestamp: Duration,
+    out: &mut Vec<EncodedFrame>,
+    budget: Duration,
+) -> Result<Submission, sidgate_encode::EncodeError> {
+    /// Pas d'attente entre deux tentatives. Assez court pour rester invisible,
+    /// assez long pour ne pas transformer l'attente en attente active.
+    const RETRY_STEP: Duration = Duration::from_micros(250);
+
+    let deadline = Instant::now() + budget;
+    loop {
+        match engine.encoder.submit(timestamp, out)? {
+            Submission::Accepted => return Ok(Submission::Accepted),
+            Submission::Busy if Instant::now() >= deadline => return Ok(Submission::Busy),
+            Submission::Busy => std::thread::sleep(RETRY_STEP),
         }
     }
 }
@@ -295,6 +354,8 @@ pub struct StatsSnapshot {
     pub captured: u64,
     /// Images encodées.
     pub encoded: u64,
+    /// Images soumises à l'encodeur.
+    pub submitted: u64,
     /// Images abandonnées.
     pub dropped: u64,
     /// Cycles à vide.
@@ -311,6 +372,7 @@ impl PipelineStats {
         StatsSnapshot {
             captured: self.captured.load(Ordering::Relaxed),
             encoded: self.encoded.load(Ordering::Relaxed),
+            submitted: self.submitted.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             idle: self.idle.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
@@ -326,6 +388,7 @@ impl StatsSnapshot {
         StatsSnapshot {
             captured: self.captured.saturating_sub(previous.captured),
             encoded: self.encoded.saturating_sub(previous.encoded),
+            submitted: self.submitted.saturating_sub(previous.submitted),
             dropped: self.dropped.saturating_sub(previous.dropped),
             idle: self.idle.saturating_sub(previous.idle),
             bytes: self.bytes.saturating_sub(previous.bytes),
@@ -349,12 +412,16 @@ impl StatsSnapshot {
         ((self.bytes as f64 * 8.0) / elapsed.as_secs_f64()) as u32
     }
 
-    /// Durée moyenne d'encodage par image, en millisecondes.
+    /// Durée moyenne d'encodage par image soumise, en millisecondes.
+    ///
+    /// Rapportée aux images réellement soumises, et non à toutes celles
+    /// capturées : une image écartée par le plafond de cadence n'a rien coûté
+    /// à l'encodeur et fausserait la moyenne vers le bas.
     pub fn encode_ms(&self) -> f32 {
-        if self.captured == 0 {
+        if self.submitted == 0 {
             return 0.0;
         }
-        self.encode_us as f32 / self.captured as f32 / 1000.0
+        self.encode_us as f32 / self.submitted as f32 / 1000.0
     }
 }
 
@@ -366,6 +433,7 @@ mod tests {
         StatsSnapshot {
             captured,
             encoded,
+            submitted: captured,
             dropped: 0,
             idle: 0,
             bytes,
@@ -413,6 +481,22 @@ mod tests {
     fn average_encode_time_handles_an_empty_interval() {
         assert_eq!(snapshot(0, 0, 0, 0).encode_ms(), 0.0);
         assert_eq!(snapshot(10, 10, 0, 20_000).encode_ms(), 2.0);
+    }
+
+    #[test]
+    fn average_encode_time_ignores_frames_never_submitted() {
+        // 100 images capturées, 10 seulement soumises : la moyenne porte sur
+        // celles qui ont réellement traversé l'encodeur.
+        let snap = StatsSnapshot {
+            captured: 100,
+            encoded: 10,
+            submitted: 10,
+            dropped: 90,
+            idle: 0,
+            bytes: 0,
+            encode_us: 20_000,
+        };
+        assert_eq!(snap.encode_ms(), 2.0);
     }
 
     #[test]

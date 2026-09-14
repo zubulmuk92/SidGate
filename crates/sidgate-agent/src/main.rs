@@ -117,8 +117,14 @@ async fn console_loop(state: Arc<AppState>) {
                     println!("  {} — {}", client.label, client.key);
                 }
             }
+            "x" | "cancel" => {
+                state.identity.lock().close_pairing();
+                println!("fenêtre d'appairage refermée");
+            }
             "" => {}
-            other => println!("commande inconnue: {other} (p = appairer, c = clients)"),
+            other => {
+                println!("commande inconnue: {other} (p = appairer, x = annuler, c = clients)");
+            }
         }
     }
 }
@@ -152,7 +158,7 @@ fn print_banner(state: &Arc<AppState>, tls: &tls::TlsMaterial, dir: &std::path::
     println!("  certificat  : {}", tls.fingerprint);
     println!("  clients     : {}", identity.clients().len());
     println!();
-    println!("  tapez « p » puis Entrée pour ouvrir un appairage");
+    println!("  tapez « p » puis Entrée pour ouvrir un appairage, « x » pour l'annuler");
     println!();
 }
 

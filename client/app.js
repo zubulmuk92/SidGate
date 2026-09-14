@@ -480,7 +480,8 @@ function renderTelemetry(stats) {
     `<b>${stats.fps.toFixed(0)}</b> i/s`,
     `<b>${mbps}</b> Mbit/s`,
     `<b>${stats.encode_ms.toFixed(1)}</b> ms enc.`,
-    stats.frames_dropped ? `<b>${stats.frames_dropped}</b> perdues` : '',
+    `<b>${stats.frames_captured}</b> capt.`,
+    stats.frames_dropped ? `<b>${stats.frames_dropped}</b> écartées` : '',
   ].filter(Boolean).join('');
 }
 

@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 use rand::TryRngCore;
 use tokio::sync::mpsc;
 
-use sidgate_input::{InputSink, PressedState};
+use sidgate_input::InputSink;
 use sidgate_proto::control::{
     Capabilities, ControlCommand, ControlEvent, CursorMode, RejectReason, Stats,
 };
@@ -330,7 +330,6 @@ struct SessionRuntime {
     control: Mutex<Option<Arc<dyn DataChannel>>>,
     cursor_absolute: AtomicBool,
     rejected_inputs: AtomicU64,
-    config: Config,
 }
 
 impl SessionRuntime {
@@ -371,7 +370,6 @@ async fn run_session(
         control: Mutex::new(None),
         cursor_absolute: AtomicBool::new(false),
         rejected_inputs: AtomicU64::new(0),
-        config: state.config.clone(),
     });
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -608,7 +606,9 @@ async fn teardown(
     runtime.pipeline.lock().take();
     session.close().await;
 
-    if runtime.config.security.lock_on_disconnect {
+    // La politique est lue sur le dispatcher : c'est lui qui détient les
+    // garde-fous de la session, et une seule source évite qu'ils divergent.
+    if runtime.dispatcher.lock().lock_on_disconnect() {
         match sidgate_input::system::lock_session() {
             Ok(()) => tracing::warn!(session = %session_id, "killswitch: session verrouillée"),
             Err(e) => tracing::error!(session = %session_id, error = %e, "killswitch en échec"),
@@ -801,6 +801,7 @@ fn stats_from(delta: &StatsSnapshot, elapsed: Duration) -> Stats {
     Stats {
         frames_captured: delta.captured,
         frames_encoded: delta.encoded,
+        frames_submitted: delta.submitted,
         frames_dropped: delta.dropped,
         frames_idle: delta.idle,
         bitrate_bps: delta.bitrate_bps(elapsed),
@@ -819,10 +820,6 @@ fn random_nonce() -> anyhow::Result<[u8; NONCE_LEN]> {
     Ok(nonce)
 }
 
-/// Rend visible le type d'état suivi, pour éviter un import inutilisé.
-#[allow(dead_code)]
-fn pressed_kind(_: &PressedState) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,6 +829,7 @@ mod tests {
         let delta = StatsSnapshot {
             captured: 120,
             encoded: 118,
+            submitted: 120,
             dropped: 2,
             idle: 5,
             bytes: 2_000_000,

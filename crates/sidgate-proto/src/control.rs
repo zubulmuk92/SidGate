@@ -169,6 +169,8 @@ pub struct Stats {
     pub frames_captured: u64,
     /// Images encodées et émises.
     pub frames_encoded: u64,
+    /// Images confiées à l'encodeur, plafond de cadence appliqué.
+    pub frames_submitted: u64,
     /// Images écartées par le canal borné, sous pression réseau.
     pub frames_dropped: u64,
     /// Cycles de capture s'étant terminés sans nouvelle image (bureau statique).
