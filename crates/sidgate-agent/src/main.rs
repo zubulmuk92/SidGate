@@ -7,6 +7,7 @@ mod config;
 mod control;
 mod identity;
 mod pipeline;
+mod service;
 mod session;
 mod signaling;
 mod tls;
@@ -39,6 +40,17 @@ enum Command {
         #[arg(long)]
         pair: bool,
     },
+    /// Démarre l'agent sans console, tel que le lance le service.
+    ///
+    /// Masqué : cette forme n'a de sens que pour le superviseur, qui la lance
+    /// dans la session interactive.
+    #[command(hide = true)]
+    Worker,
+    /// Installe, retire ou pilote le service Windows.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Affiche l'identité de l'agent et l'emplacement de ses données.
     Info,
     /// Liste les clients appairés.
@@ -50,20 +62,68 @@ enum Command {
     },
 }
 
+/// Actions sur le service Windows. Toutes exigent une invite élevée, sauf
+/// l'affichage de l'état.
+#[derive(Debug, Subcommand)]
+enum ServiceAction {
+    /// Installe le service en démarrage automatique.
+    Install,
+    /// Retire le service.
+    Uninstall,
+    /// Démarre le service.
+    Start,
+    /// Arrête le service.
+    Stop,
+    /// Affiche l'état du service et de la session interactive.
+    Status,
+    /// Point d'entrée du gestionnaire de services.
+    ///
+    /// Masqué : invoquer cette commande à la main échoue, le processus devant
+    /// être démarré par le gestionnaire lui-même.
+    #[command(hide = true)]
+    Run,
+}
+
 fn main() -> anyhow::Result<()> {
     init_tracing();
     install_crypto_provider()?;
 
     let cli = Cli::parse();
+
+    // Les commandes de service ne touchent pas a la configuration de l'agent :
+    // la charger ici ecrirait un fichier par defaut au premier « status », ce
+    // qu'une commande de lecture n'a pas a faire.
+    if let Some(Command::Service { action }) = &cli.command {
+        return match action {
+            ServiceAction::Install => service::manager::install(),
+            ServiceAction::Uninstall => service::manager::uninstall(),
+            ServiceAction::Start => service::manager::start(),
+            ServiceAction::Stop => service::manager::stop(),
+            ServiceAction::Status => service::manager::status(),
+            ServiceAction::Run => service::dispatch(),
+        };
+    }
+
     let dir = config::data_dir();
     let config = Config::load_or_create(&dir)?;
 
     match cli.command.unwrap_or(Command::Run { pair: false }) {
-        Command::Run { pair } => run(dir, config, pair),
+        Command::Run { pair } => run(dir, config, pair, Console::Interactive),
+        Command::Worker => run(dir, config, false, Console::None),
+        Command::Service { .. } => unreachable!("traite plus haut"),
         Command::Info => info(dir, config),
         Command::Clients => clients(dir, config),
         Command::Revoke { key } => revoke(dir, config, &key),
     }
+}
+
+/// L'agent dispose-t-il d'une console avec laquelle dialoguer ?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Console {
+    /// Lancement à la main : bannière, commandes clavier, appairage possible.
+    Interactive,
+    /// Lancement par le service : personne pour lire ni pour taper.
+    None,
 }
 
 /// Démarre le serveur et la boucle de commandes console.
@@ -71,7 +131,12 @@ fn main() -> anyhow::Result<()> {
 /// Le `main` reste synchrone et construit le runtime ici : cela garde le
 /// démarrage lisible et laisse la possibilité d'un enregistrement en service
 /// Windows, qui impose sa propre entrée.
-fn run(dir: std::path::PathBuf, config: Config, pair_now: bool) -> anyhow::Result<()> {
+fn run(
+    dir: std::path::PathBuf,
+    config: Config,
+    pair_now: bool,
+    console: Console,
+) -> anyhow::Result<()> {
     let identity = Identity::load_or_create(&dir, config.security.auth_attempts_per_minute)?;
     let tls = tls::load_or_create(&dir, config.network.bind, &[])?;
 
@@ -82,12 +147,21 @@ fn run(dir: std::path::PathBuf, config: Config, pair_now: bool) -> anyhow::Resul
         busy: AtomicBool::new(false),
     });
 
-    print_banner(&state, &tls, &dir);
+    if console == Console::Interactive {
+        print_banner(&state, &tls, &dir);
 
-    // Un agent sans client appairé n'est joignable par personne : ouvrir la
-    // fenêtre d'emblée évite d'avoir à expliquer une deuxième étape.
-    if pair_now || no_clients {
-        open_pairing(&state);
+        // Un agent sans client appairé n'est joignable par personne : ouvrir la
+        // fenêtre d'emblée évite d'avoir à expliquer une deuxième étape.
+        if pair_now || no_clients {
+            open_pairing(&state);
+        }
+    } else if no_clients {
+        // Sous service, personne ne peut lire un code : l'appairage se fait en
+        // lançant l'agent à la main une première fois.
+        tracing::warn!(
+            "aucun client appairé ; lancez « sidgate run » depuis une session \
+             interactive pour appairer un appareil"
+        );
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -95,9 +169,12 @@ fn run(dir: std::path::PathBuf, config: Config, pair_now: bool) -> anyhow::Resul
         .build()?;
 
     runtime.block_on(async move {
-        let console = tokio::spawn(console_loop(Arc::clone(&state)));
+        let reader = (console == Console::Interactive)
+            .then(|| tokio::spawn(console_loop(Arc::clone(&state))));
         let result = signaling::serve(Arc::clone(&state), tls).await;
-        console.abort();
+        if let Some(reader) = reader {
+            reader.abort();
+        }
         result
     })
 }

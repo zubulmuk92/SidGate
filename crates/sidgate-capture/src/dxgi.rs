@@ -34,6 +34,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 
+use crate::desktop::DesktopGuard;
 use crate::{CaptureError, DesktopInfo, FrameSource, FrameStatus};
 
 /// Position du pointeur telle que rapportée par le compositeur.
@@ -53,6 +54,9 @@ pub struct PointerState {
 
 /// Capteur DXGI d'une sortie vidéo.
 pub struct DxgiCapturer {
+    // Premier champ : sa destruction rend le thread a son bureau d'origine, ce
+    // qui doit arriver apres la liberation de la duplication qu'il porte.
+    // L'ordre de destruction des champs suit l'ordre de declaration.
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
@@ -60,6 +64,10 @@ pub struct DxgiCapturer {
     target_resource: ID3D11Resource,
     info: DesktopInfo,
     pointer: PointerState,
+    /// Detenu pour son `Drop` seul, jamais lu. Declare en dernier : le thread
+    /// ne revient a son bureau d'origine qu'une fois la duplication et le
+    /// device liberes, l'ordre de destruction suivant l'ordre de declaration.
+    _desktop: DesktopGuard,
 }
 
 impl std::fmt::Debug for DxgiCapturer {
@@ -77,6 +85,11 @@ impl DxgiCapturer {
     /// L'index parcourt les sorties de tous les adaptateurs, dans l'ordre
     /// d'énumération DXGI : `0` désigne l'écran principal du premier GPU.
     pub fn new(output_index: u32) -> Result<Self, CaptureError> {
+        // Se rattacher au bureau d'entree avant toute chose : la duplication
+        // est liee au bureau du thread qui la cree, et ce bureau change a
+        // chaque verrouillage ou elevation UAC.
+        let desktop = DesktopGuard::attach_to_input_desktop()?;
+
         let (adapter, output) = find_output(output_index)?;
         let (device, context) = create_device(&adapter)?;
 
@@ -122,6 +135,7 @@ impl DxgiCapturer {
             target_resource,
             info,
             pointer: PointerState::default(),
+            _desktop: desktop,
         })
     }
 

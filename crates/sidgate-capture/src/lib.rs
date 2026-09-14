@@ -18,6 +18,8 @@
 use std::time::Duration;
 
 #[cfg(windows)]
+pub mod desktop;
+#[cfg(windows)]
 pub mod dxgi;
 
 #[cfg(windows)]

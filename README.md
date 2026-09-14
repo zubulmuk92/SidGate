@@ -42,7 +42,7 @@ fin de session.
 | Injection d'entrées, dispatcher de commandes | fait |
 | Client PWA | fait |
 | Nœud Raspberry Pi : Headscale, Caddy, nftables, réveil WoL | fait |
-| Service Windows et accès pré-connexion | à faire |
+| Service Windows, suivi du bureau d'entrée | fait |
 | Backend Linux (PipeWire / VA-API) | à faire |
 
 ## Démarrage
@@ -60,6 +60,39 @@ l'annuler, `c` pour lister les appareils autorisés.
 
 Configuration dans `%PROGRAMDATA%\sidgate\sidgate.toml`. Tout y est refusé par
 défaut : écoute sur la boucle locale, actions d'alimentation désactivées.
+
+## Service Windows
+
+Pour que l'agent démarre au boot et survive aux changements de session, depuis
+une invite **administrateur** :
+
+```bash
+sidgate service install
+sidgate service start
+```
+
+`sidgate service status` renseigne sur l'état, sans élévation.
+
+Le service ne fait qu'une chose : maintenir un travailleur vivant dans la
+session interactive, et le relancer quand elle change. Il n'ouvre aucun socket
+et ne lit rien venant du réseau — c'est le seul processus tournant en
+permanence sous le compte système, et sa pauvreté est délibérée.
+
+### Accès pré-connexion
+
+Par défaut le travailleur prend l'identité de l'utilisateur connecté : moindre
+privilège, mais il ne peut pas capturer l'écran de verrouillage, qui appartient
+au bureau `Winlogon` de Winlogon.
+
+Pour un écran verrouillé, il faut que le travailleur tourne en SYSTEM dans la
+session interactive :
+
+```
+SIDGATE_WORKER_IDENTITY=system
+```
+
+C'est un vrai compromis : le processus qui écoute le réseau devient SYSTEM.
+Il se réclame explicitement, et n'arrive jamais par effet de bord.
 
 En production, mettre `bind` à l'adresse de l'interface WireGuard : l'agent
 n'existe alors sur aucune interface physique.

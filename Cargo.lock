@@ -2604,6 +2604,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webrtc",
+ "windows",
 ]
 
 [[package]]
