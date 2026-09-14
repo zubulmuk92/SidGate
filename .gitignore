@@ -1,4 +1,6 @@
-/target
+# Ancre absente volontairement : l'espace de travail du service de reveil
+# possede son propre target/ imbrique.
+target/
 **/*.rs.bk
 *.pdb
 /dist
