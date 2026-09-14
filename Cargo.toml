@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sidgate-proto",
+    "crates/sidgate-capture",
+    "crates/sidgate-encode",
+    "crates/sidgate-input",
+    "crates/sidgate-agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "AGPL-3.0-only"
+repository = "https://github.com/sidgate/sidgate"
+authors = ["sidgate contributors"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench-rt]
+inherits = "release"
+debug = true
+strip = false
