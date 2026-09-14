@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+/dist
+/out
+*.h264
+*.hevc
+*.ivf
+node_modules/
+.env
+.DS_Store
