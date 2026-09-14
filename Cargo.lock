@@ -2616,8 +2616,10 @@ name = "sidgate-encode"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "sidgate-capture",
  "thiserror 2.0.20",
  "tracing",
+ "tracing-subscriber",
  "windows",
 ]
 
