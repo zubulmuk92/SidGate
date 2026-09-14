@@ -210,6 +210,18 @@ pub enum ControlEvent {
     },
     /// Remontée de télémétrie.
     Stats(Stats),
+    /// La capture est momentanément impossible.
+    ///
+    /// Le cas courant est une session hôte verrouillée : le bureau de
+    /// verrouillage appartient à Winlogon et reste hors de portée d'un
+    /// processus utilisateur. La session reste ouverte et la vidéo reprend
+    /// d'elle-même.
+    CaptureUnavailable {
+        /// Explication destinée à l'utilisateur.
+        message: String,
+    },
+    /// La capture a repris après une interruption.
+    CaptureResumed,
     /// La géométrie du bureau capturé a changé.
     DisplayChanged {
         /// Nouvelle largeur, en pixels.

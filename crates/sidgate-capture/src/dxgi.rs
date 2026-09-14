@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use windows::core::{Interface, HRESULT};
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource,
@@ -88,7 +88,13 @@ impl DxgiCapturer {
         }
 
         // SAFETY: `device` vient d'être créé et vit plus longtemps que l'appel.
-        let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(map_hresult)?;
+        let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(|e| {
+            if e.code() == E_ACCESSDENIED {
+                CaptureError::DesktopUnavailable
+            } else {
+                map_hresult(e)
+            }
+        })?;
 
         // SAFETY: `desc` est entièrement écrit par l'appel avant lecture.
         let desc = unsafe { duplication.GetDesc() };
@@ -166,6 +172,9 @@ impl FrameSource for DxgiCapturer {
             Ok(()) => {}
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(FrameStatus::Idle),
             Err(e) if is_lost(e.code()) => return Err(CaptureError::Lost),
+            // Une bascule vers le bureau sécurisé en pleine session se
+            // manifeste ici plutôt qu'à l'ouverture.
+            Err(e) if e.code() == E_ACCESSDENIED => return Err(CaptureError::Lost),
             Err(e) => return Err(map_hresult(e)),
         }
 

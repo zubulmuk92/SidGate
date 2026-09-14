@@ -61,6 +61,14 @@ pub enum CaptureError {
     /// Aucune sortie vidéo à l'index demandé.
     #[error("sortie vidéo {0} introuvable")]
     OutputNotFound(u32),
+    /// Le bureau courant n'est pas accessible au processus.
+    ///
+    /// Un processus tournant dans la session de l'utilisateur ne peut pas
+    /// dupliquer l'écran de verrouillage ni le bureau sécurisé (UAC,
+    /// Ctrl+Alt+Suppr) : ces bureaux appartiennent à Winlogon. La capture
+    /// redevient possible d'elle-même dès le retour au bureau interactif.
+    #[error("bureau inaccessible : session verrouillée ou bureau sécurisé actif")]
+    DesktopUnavailable,
     /// Erreur remontée par l'API système.
     #[error("erreur système: {0}")]
     System(String),

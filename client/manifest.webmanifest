@@ -1,0 +1,19 @@
+{
+  "name": "sidgate",
+  "short_name": "sidgate",
+  "description": "Accès distant sécurisé à la station de travail",
+  "start_url": "/",
+  "scope": "/",
+  "display": "fullscreen",
+  "orientation": "any",
+  "background_color": "#0b0d10",
+  "theme_color": "#0b0d10",
+  "icons": [
+    {
+      "src": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxOTIgMTkyIj48cmVjdCB3aWR0aD0iMTkyIiBoZWlnaHQ9IjE5MiIgcng9IjQwIiBmaWxsPSIjMGIwZDEwIi8+PHBhdGggZD0iTTk2IDM0bDQ2IDIwdjQwYzAgMzAtMTkgNTItNDYgNjQtMjctMTItNDYtMzQtNDYtNjRWNTR6IiBmaWxsPSJub25lIiBzdHJva2U9IiM0ZGEzZmYiIHN0cm9rZS13aWR0aD0iMTAiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBkPSJNNzYgOTZsMTQgMTQgMjgtMzAiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzRkYTNmZiIgc3Ryb2tlLXdpZHRoPSIxMCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PC9zdmc+",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
