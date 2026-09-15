@@ -213,6 +213,9 @@ const state = {
   seq: 0,
   pending: [],
   flushScheduled: false,
+  statsTimer: null,
+  rtcPrevious: null,
+  rtc: null,
 };
 
 function setStatus(text, isError = false) {
@@ -352,11 +355,16 @@ async function onAuthOk(payload) {
 
   const firstTime = !(await dbGet('agent'));
   await dbPut('agent', state.agentKey);
-  if (firstTime) await enrollBiometrics(state.identity.publicKeyHex);
 
   ui.pairing.hidden = true;
   setStatus('Négociation du flux…');
   await startWebrtc();
+
+  // Proposé après le démarrage du flux, et sans l'attendre : l'invite
+  // biométrique peut rester ouverte jusqu'à une minute, et la bloquer ici
+  // retardait d'autant la première image — 23 s mesurées quand personne n'y
+  // répondait.
+  if (firstTime) enrollBiometrics(state.identity.publicKeyHex);
 }
 
 function onAuthFailed({ reason }) {
@@ -387,6 +395,18 @@ async function startWebrtc() {
 
   peer.ontrack = (event) => {
     ui.video.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+
+    // Par défaut le navigateur retient les images dans un tampon de gigue pour
+    // lisser la lecture — le bon choix pour une visioconférence, le mauvais
+    // pour piloter un bureau. Mesuré avant ce réglage : 94 à 175 ms de tampon,
+    // soit l'essentiel de la latence. `jitterBufferTarget` est l'API standard ;
+    // `playoutDelayHint` est l'ancienne forme propre à Chrome.
+    const receiver = event.receiver;
+    if (receiver && 'jitterBufferTarget' in receiver) {
+      receiver.jitterBufferTarget = 0;
+    } else if (receiver && 'playoutDelayHint' in receiver) {
+      receiver.playoutDelayHint = 0;
+    }
   };
   peer.onicecandidate = ({ candidate }) => {
     if (!candidate) return;
@@ -410,6 +430,10 @@ async function startWebrtc() {
 
 function beginSession() {
   state.live = true;
+  state.rtcPrevious = null;
+  state.rtc = null;
+  clearInterval(state.statsTimer);
+  state.statsTimer = setInterval(sampleRtcStats, 2000);
   ui.gate.hidden = true;
   ui.stage.classList.add('live');
   ui.cursor.classList.add('on');
@@ -421,6 +445,8 @@ function beginSession() {
 function endSession(message) {
   if (!state.live && ui.gate.hidden === false) setStatus(message, true);
   state.live = false;
+  clearInterval(state.statsTimer);
+  state.statsTimer = null;
   ui.stage.classList.remove('live');
   ui.cursor.classList.remove('on');
   ui.gate.hidden = false;
@@ -429,6 +455,116 @@ function endSession(message) {
   setStatus(message, true);
   state.peer?.close();
   state.peer = null;
+}
+
+// --- Latence ----------------------------------------------------------------
+
+/**
+ * Relève les statistiques WebRTC du récepteur vidéo.
+ *
+ * Les compteurs du navigateur sont cumulés depuis le début de la session : on
+ * travaille sur la différence entre deux relevés, sans quoi un pic de gigue
+ * survenu à la première seconde pèserait encore sur la moyenne une heure plus
+ * tard.
+ */
+async function sampleRtcStats() {
+  if (!state.peer) return;
+  let report;
+  try {
+    report = await state.peer.getStats();
+  } catch {
+    return;
+  }
+
+  let inbound = null;
+  let rttSeconds = null;
+  report.forEach((entry) => {
+    if (entry.type === 'inbound-rtp' && entry.kind === 'video') inbound = entry;
+    if (entry.type === 'candidate-pair' && entry.state === 'succeeded'
+        && (entry.nominated || entry.selected)
+        && typeof entry.currentRoundTripTime === 'number') {
+      rttSeconds = entry.currentRoundTripTime;
+    }
+  });
+  if (!inbound) return;
+
+  // Un champ que le navigateur n'expose pas vaut `null`, jamais 0 : afficher
+  // « 0 ms de décodage » là où rien n'est mesuré serait inventer une mesure.
+  const numeric = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+  const current = {
+    jitterDelay: numeric(inbound.jitterBufferDelay),
+    jitterCount: numeric(inbound.jitterBufferEmittedCount),
+    decodeTime: numeric(inbound.totalDecodeTime),
+    decoded: numeric(inbound.framesDecoded),
+    lost: numeric(inbound.packetsLost),
+    received: numeric(inbound.packetsReceived),
+  };
+  const previous = state.rtcPrevious;
+  state.rtcPrevious = current;
+  if (!previous) return;
+
+  state.rtc = {
+    jitterMs: perUnitDelta(current.jitterDelay, previous.jitterDelay,
+      current.jitterCount, previous.jitterCount, 1000),
+    decodeMs: perUnitDelta(current.decodeTime, previous.decodeTime,
+      current.decoded, previous.decoded, 1000),
+    rttMs: rttSeconds === null ? null : rttSeconds * 1000,
+    lossPercent: lossPercentDelta(current, previous),
+  };
+}
+
+/**
+ * Moyenne par unité sur l'intervalle, mise à l'échelle.
+ *
+ * Renvoie `null` si une valeur manque ou si aucune unité n'est passée dans
+ * l'intervalle. La multiplication se fait ici, après ce test, et non sur le
+ * résultat : en JavaScript `null * 1000` vaut 0, et c'est exactement par là
+ * qu'une absence de mesure devenait un « 0,0 ms » affiché.
+ */
+function perUnitDelta(valueNow, valueBefore, countNow, countBefore, scale) {
+  if ([valueNow, valueBefore, countNow, countBefore].includes(null)) return null;
+  const count = countNow - countBefore;
+  if (count <= 0) return null;
+  return ((valueNow - valueBefore) / count) * scale;
+}
+
+/** Part de paquets perdus sur l'intervalle, en pourcentage, ou `null`. */
+function lossPercentDelta(current, previous) {
+  if ([current.lost, previous.lost, current.received, previous.received].includes(null)) {
+    return null;
+  }
+  const lost = Math.max(0, current.lost - previous.lost);
+  const total = lost + (current.received - previous.received);
+  return total > 0 ? (lost / total) * 100 : null;
+}
+
+/**
+ * Latence estimée du pipeline, en millisecondes.
+ *
+ * Somme de ce que l'on sait mesurer : capture et encodage côté hôte, trajet
+ * aller (la moitié de l'aller-retour), attente dans le tampon de gigue, et
+ * décodage. N'y figurent pas l'attente de présentation du compositeur de l'hôte
+ * ni la synchronisation verticale de l'écran client — jusqu'à une image chacune
+ * à 60 Hz. C'est donc une borne basse, et elle est affichée comme telle.
+ */
+function estimateLatencyMs(encodeMs) {
+  const rtc = state.rtc;
+  const terms = {
+    encodeMs: typeof encodeMs === 'number' && encodeMs > 0 ? encodeMs : null,
+    networkMs: rtc && rtc.rttMs !== null ? rtc.rttMs / 2 : null,
+    jitterMs: rtc ? rtc.jitterMs : null,
+    decodeMs: rtc ? rtc.decodeMs : null,
+  };
+  const known = Object.values(terms).filter((value) => value !== null);
+  if (known.length === 0) return null;
+  return {
+    ...terms,
+    // Somme des seuls termes mesurés : une borne basse, d'autant plus basse
+    // qu'il en manque. `complete` le signale à l'affichage.
+    total: known.reduce((sum, value) => sum + value, 0),
+    complete: known.length === Object.keys(terms).length,
+    lossPercent: rtc ? rtc.lossPercent : null,
+  };
 }
 
 // --- Canal de contrôle ------------------------------------------------------
@@ -476,13 +612,24 @@ function handleControlEvent(event) {
 
 function renderTelemetry(stats) {
   const mbps = (stats.bitrate_bps / 1e6).toFixed(1);
+  const latency = estimateLatencyMs(stats.encode_ms);
+  // Uniquement des nombres formatés : aucune chaîne venue du réseau n'est
+  // insérée ici, d'où l'usage acceptable d'innerHTML pour la mise en forme.
   ui.telemetry.innerHTML = [
+    latency ? `<b>≥${latency.total.toFixed(0)}</b> ms lat.${latency.complete ? '' : '*'}` : '',
     `<b>${stats.fps.toFixed(0)}</b> i/s`,
     `<b>${mbps}</b> Mbit/s`,
-    `<b>${stats.encode_ms.toFixed(1)}</b> ms enc.`,
-    `<b>${stats.frames_captured}</b> capt.`,
+    latency && latency.lossPercent !== null && latency.lossPercent >= 0.1
+      ? `<b>${latency.lossPercent.toFixed(1)}</b> % pertes` : '',
     stats.frames_dropped ? `<b>${stats.frames_dropped}</b> écartées` : '',
   ].filter(Boolean).join('');
+  const term = (value) => (value === null ? 'n/d' : `${value.toFixed(1)} ms`);
+  ui.telemetry.title = latency
+    ? `encodage ${term(latency.encodeMs)} · réseau ${term(latency.networkMs)} · `
+      + `gigue ${term(latency.jitterMs)} · décodage ${term(latency.decodeMs)} — `
+      + 'borne basse, hors présentation et synchronisation verticale'
+      + (latency.complete ? '' : ' ; * termes non mesurés par ce navigateur exclus')
+    : 'mesure de latence en cours';
 }
 
 // --- Entrées ----------------------------------------------------------------

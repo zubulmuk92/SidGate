@@ -30,6 +30,35 @@ pilote GPU et de Media Foundation restent chargées une fois utilisées. Y
 remédier demanderait d'isoler la capture dans un processus enfant détruit à la
 fin de session.
 
+### Latence
+
+La cible de 35 ms **n'est pas démontrée**. Ce qui est mesuré, en boucle locale :
+
+| Terme | Mesure |
+| --- | --- |
+| Capture et encodage | 2 à 4 ms |
+| Réseau (moitié de l'aller-retour) | 0,5 ms |
+| Tampon de gigue du navigateur, régime établi | ~22 ms |
+| Décodage | 1 à 4 ms |
+| **Somme** | **≥ 29 ms** |
+
+C'est une borne basse : n'y figurent ni l'attente de présentation du
+compositeur de l'hôte, ni la synchronisation verticale de l'écran client —
+jusqu'à une image chacune à 60 Hz. Une mesure écran à écran reste à faire.
+
+Le tampon de gigue dominait avant réglage. Le client fixe désormais
+`jitterBufferTarget = 0` sur le récepteur vidéo. Sur une paire de sessions à
+bureau actif : 61 à 281 ms par image sans réglage, 30 à 60 ms avec. Une seule
+paire exploitable, sous une charge non contrôlée : l'écart est net, pas encore
+chiffré avec rigueur.
+
+La télémétrie du client affiche cette somme en direct, et `n/d` pour tout terme
+que le navigateur n'expose pas plutôt qu'un zéro inventé.
+
+```bash
+node client/tests/latency.test.mjs
+```
+
 ## État
 
 | Phase | |
