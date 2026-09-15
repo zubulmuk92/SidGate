@@ -23,7 +23,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::{Path as UrlPath, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,8 @@ async fn main() -> anyhow::Result<()> {
 
     let address = SocketAddr::new(config.listen, config.port);
     let app = Router::new()
+        .route("/", get(page))
+        .route("/wake.js", get(page_script))
         .route("/hosts", get(list_hosts))
         .route("/wake/{name}", post(wake))
         .with_state(Arc::clone(&config));
@@ -114,6 +117,44 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
             .ok_or_else(|| anyhow::anyhow!("adresse MAC invalide pour {}: {}", host.name, host.mac))?;
     }
     Ok(config)
+}
+
+/// Politique de sécurité de la page de réveil.
+///
+/// Aucun script en ligne n'est autorisé : le code vit dans `/wake.js`, servi par
+/// la même origine. Les seules requêtes permises visent le service lui-même.
+const PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; \
+                        connect-src 'self'; base-uri 'none'; form-action 'none'; \
+                        frame-ancestors 'none'";
+
+/// Page de réveil, embarquée dans le binaire.
+///
+/// Elle est servie ici plutôt que par l'agent parce que l'agent est éteint au
+/// moment exact où l'on en a besoin. La page ne contient aucun secret : le jeton
+/// est saisi par l'utilisateur et chaque appel à l'API le vérifie.
+async fn page() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, PAGE_CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        include_str!("wake.html"),
+    )
+}
+
+/// Script de la page de réveil.
+async fn page_script() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        include_str!("wake.js"),
+    )
 }
 
 async fn list_hosts(
@@ -284,6 +325,32 @@ mod tests {
             hosts = []
         "#;
         assert!(toml::from_str::<Config>(text).is_err());
+    }
+
+    #[test]
+    fn page_policy_forbids_inline_scripts() {
+        let script_directive = PAGE_CSP
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("script-src"))
+            .expect("la politique doit régler les scripts");
+        assert_eq!(script_directive, "script-src 'self'");
+        assert!(!include_str!("wake.html").contains("<script>"), "aucun script en ligne");
+    }
+
+    #[test]
+    fn page_never_renders_server_data_as_markup() {
+        // Les noms de machines viennent de la configuration : ils ne doivent
+        // jamais pouvoir injecter de balisage. Les commentaires sont écartés,
+        // puisque le script documente justement cette interdiction.
+        let code_lines = include_str!("wake.js")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"));
+        for line in code_lines {
+            assert!(!line.contains("innerHTML"), "balisage injectable : {line}");
+            assert!(!line.contains("outerHTML"), "balisage injectable : {line}");
+            assert!(!line.contains("insertAdjacentHTML"), "balisage injectable : {line}");
+        }
     }
 
     #[test]

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<title>sidgate — réveil</title>
+<style>
+  :root {
+    --bg: #0b0d10; --panel: #14181e; --line: #232a33;
+    --text: #e6eaef; --muted: #8b97a6; --accent: #4da3ff;
+    --danger: #ff6b6b; --ok: #5ad18f;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; min-height: 100%;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main {
+    max-width: 26rem; margin: 0 auto;
+    padding: calc(40px + env(safe-area-inset-top)) 20px 40px;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  .mark { font-size: 26px; font-weight: 650; letter-spacing: -0.02em; }
+  .mark span { color: var(--accent); }
+  p { margin: 0; color: var(--muted); }
+  label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 13px; }
+  input {
+    font: 14px/1 ui-monospace, Menlo, monospace; color: var(--text);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px;
+  }
+  button {
+    font: inherit; font-weight: 550; color: var(--text);
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 13px 16px; cursor: pointer; text-align: left;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); color: #04070c; border-color: var(--accent); justify-content: center; }
+  #hosts { display: flex; flex-direction: column; gap: 8px; }
+  #hosts[hidden], #unlock[hidden] { display: none; }
+  #status { min-height: 1.4em; }
+  #status.error { color: var(--danger); }
+  #status.ok { color: var(--ok); }
+  .hint { font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="mark">sid<span>gate</span> · réveil</div>
+  <p>Envoie un Magic Packet sur le réseau local de l'hôte. Cette page n'est
+     joignable que depuis le tunnel WireGuard.</p>
+
+  <form id="unlock">
+    <label>Jeton du service de réveil
+      <input id="token" type="password" autocomplete="off" spellcheck="false" required>
+    </label>
+    <button class="primary" type="submit">Afficher les machines</button>
+    <p class="hint">Conservé sur cet appareil, qui détient déjà la clé
+       WireGuard donnant accès au tunnel.</p>
+  </form>
+
+  <div id="hosts" hidden></div>
+  <p id="status" role="status"></p>
+</main>
+<script src="/wake.js"></script>
+</body>
+</html>

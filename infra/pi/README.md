@@ -34,7 +34,11 @@ sudo cp ../sidgate-wol.service /etc/systemd/system/
 sudo systemctl enable --now sidgate-wol
 ```
 
-Appel depuis le tunnel :
+Depuis un appareil du tunnel, ouvrir `http://100.64.0.1:9797/` : la page liste
+les machines déclarées et envoie le Magic Packet d'un clic. Elle est servie par
+le Pi et non par l'agent, puisque l'agent est éteint quand on en a besoin.
+
+En ligne de commande :
 
 ```bash
 curl -X POST -H "X-Sidgate-Token: $TOKEN" http://100.64.0.1:9797/wake/station
