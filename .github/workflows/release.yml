@@ -1,0 +1,50 @@
+name: Version
+
+# Pousser une étiquette `v1.2.3` construit l'agent et publie le binaire avec
+# son empreinte. L'étiquette doit correspondre à la version du Cargo.toml.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  agent:
+    name: Agent (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Vérifier que l'étiquette est celle de la version
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | python -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'sidgate-agent'))")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::étiquette $GITHUB_REF_NAME, mais Cargo.toml annonce $version"
+            exit 1
+          fi
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Construction
+        run: cargo build --release --locked
+
+      - name: Empreinte
+        shell: bash
+        run: |
+          cd target/release
+          sha256sum sidgate.exe > sidgate.exe.sha256
+          cat sidgate.exe.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/sidgate.exe
+            target/release/sidgate.exe.sha256
+          generate_release_notes: true

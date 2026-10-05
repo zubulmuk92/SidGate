@@ -110,11 +110,15 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
         !config.listen.is_unspecified(),
         "l'écoute doit être liée à l'adresse de wg0, pas à toutes les interfaces"
     );
-    anyhow::ensure!(config.token.len() >= 16, "le jeton doit faire au moins 16 caractères");
+    anyhow::ensure!(
+        config.token.len() >= 16,
+        "le jeton doit faire au moins 16 caractères"
+    );
     anyhow::ensure!(!config.hosts.is_empty(), "aucune machine déclarée");
     for host in &config.hosts {
-        parse_mac(&host.mac)
-            .ok_or_else(|| anyhow::anyhow!("adresse MAC invalide pour {}: {}", host.name, host.mac))?;
+        parse_mac(&host.mac).ok_or_else(|| {
+            anyhow::anyhow!("adresse MAC invalide pour {}: {}", host.name, host.mac)
+        })?;
     }
     Ok(config)
 }
@@ -335,7 +339,10 @@ mod tests {
             .find(|d| d.starts_with("script-src"))
             .expect("la politique doit régler les scripts");
         assert_eq!(script_directive, "script-src 'self'");
-        assert!(!include_str!("wake.html").contains("<script>"), "aucun script en ligne");
+        assert!(
+            !include_str!("wake.html").contains("<script>"),
+            "aucun script en ligne"
+        );
     }
 
     #[test]
@@ -349,7 +356,10 @@ mod tests {
         for line in code_lines {
             assert!(!line.contains("innerHTML"), "balisage injectable : {line}");
             assert!(!line.contains("outerHTML"), "balisage injectable : {line}");
-            assert!(!line.contains("insertAdjacentHTML"), "balisage injectable : {line}");
+            assert!(
+                !line.contains("insertAdjacentHTML"),
+                "balisage injectable : {line}"
+            );
         }
     }
 
