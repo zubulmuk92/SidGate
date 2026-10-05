@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use sidgate_proto::control::{ControlCommand, CursorMode, QualityPreset, RejectReason};
+use sidgate_proto::control::{ControlCommand, QualityPreset, RejectReason};
 
 use crate::config::SecurityConfig;
 
@@ -32,12 +32,14 @@ pub enum Effect {
     Keyframe,
     /// Changer le débit cible.
     Bitrate(u32),
-    /// Changer le mode de pointage.
-    CursorMode(CursorMode),
     /// Émettre une remontée de télémétrie.
     SendStats,
     /// Enregistrer la réponse à une sonde de latence.
     Pong(u32),
+    /// Basculer la capture sur une autre sortie vidéo.
+    SelectDisplay(u32),
+    /// Envoyer le texte du presse-papiers de l'hôte.
+    SendClipboard,
     /// Verrouiller la session.
     Lock,
     /// Mettre en veille.
@@ -54,6 +56,7 @@ pub struct Dispatcher {
     security: SecurityConfig,
     width: u32,
     height: u32,
+    displays: u32,
     recent: VecDeque<Instant>,
 }
 
@@ -64,8 +67,19 @@ impl Dispatcher {
             security,
             width,
             height,
+            displays: 1,
             recent: VecDeque::with_capacity(RATE_LIMIT),
         }
+    }
+
+    /// Met à jour la géométrie du bureau capturé et le nombre de sorties.
+    ///
+    /// L'historique de limitation de débit est conservé : changer d'écran ne
+    /// remet pas le compteur à zéro.
+    pub fn set_geometry(&mut self, width: u32, height: u32, displays: u32) {
+        self.width = width;
+        self.height = height;
+        self.displays = displays.max(1);
     }
 
     /// Autorise ou refuse une commande.
@@ -79,6 +93,10 @@ impl Dispatcher {
             );
             return Err(RejectReason::NotPermitted);
         }
+        if matches!(command, ControlCommand::RequestClipboard) && !self.security.allow_clipboard {
+            tracing::warn!("lecture du presse-papiers refusée par la configuration");
+            return Err(RejectReason::NotPermitted);
+        }
 
         let effect = match command {
             ControlCommand::Lock => Effect::Lock,
@@ -87,21 +105,31 @@ impl Dispatcher {
             ControlCommand::Shutdown => Effect::Shutdown,
             ControlCommand::RequestKeyframe => Effect::Keyframe,
             ControlCommand::SetQuality { preset } => Effect::Bitrate(self.bitrate_for(preset)),
-            ControlCommand::SetCursorMode { mode } => Effect::CursorMode(mode),
             ControlCommand::RequestStats => Effect::SendStats,
             ControlCommand::Pong { seq } => Effect::Pong(seq),
+            ControlCommand::SelectDisplay { index } => {
+                let index = u32::from(index);
+                if index >= self.displays {
+                    return Err(RejectReason::WrongState);
+                }
+                Effect::SelectDisplay(index)
+            }
+            ControlCommand::RequestClipboard => Effect::SendClipboard,
         };
 
-        tracing::info!(command = command.name(), "commande acceptée");
+        // Les réponses aux sondes reviennent toutes les deux secondes : les
+        // journaliser noierait tout le reste.
+        if !matches!(command, ControlCommand::Pong { .. }) {
+            tracing::info!(command = command.name(), "commande acceptée");
+        }
         Ok(effect)
     }
 
     /// Mise à l'échelle du palier de qualité sur la surface réelle du bureau.
-    fn bitrate_for(&self, preset: QualityPreset) -> u32 {
+    pub fn bitrate_for(&self, preset: QualityPreset) -> u32 {
         const REFERENCE_PIXELS: u64 = 1920 * 1080;
         let pixels = u64::from(self.width) * u64::from(self.height);
-        let scaled =
-            u64::from(preset.target_bitrate_1080p()) * pixels.max(1) / REFERENCE_PIXELS;
+        let scaled = u64::from(preset.target_bitrate_1080p()) * pixels.max(1) / REFERENCE_PIXELS;
         scaled.clamp(500_000, 100_000_000) as u32
     }
 
@@ -251,17 +279,73 @@ mod tests {
     }
 
     #[test]
-    fn cursor_mode_and_pong_pass_through() {
+    fn probe_answers_pass_through() {
         let mut d = dispatcher(SecurityConfig::default());
-        assert_eq!(
-            d.dispatch(ControlCommand::SetCursorMode {
-                mode: CursorMode::Absolute
-            }),
-            Ok(Effect::CursorMode(CursorMode::Absolute))
-        );
         assert_eq!(
             d.dispatch(ControlCommand::Pong { seq: 17 }),
             Ok(Effect::Pong(17))
+        );
+    }
+
+    #[test]
+    fn clipboard_reading_is_refused_by_default() {
+        let mut d = dispatcher(SecurityConfig::default());
+        assert_eq!(
+            d.dispatch(ControlCommand::RequestClipboard),
+            Err(RejectReason::NotPermitted)
+        );
+
+        let mut d = dispatcher(SecurityConfig {
+            allow_clipboard: true,
+            ..SecurityConfig::default()
+        });
+        assert_eq!(
+            d.dispatch(ControlCommand::RequestClipboard),
+            Ok(Effect::SendClipboard)
+        );
+    }
+
+    #[test]
+    fn only_existing_displays_can_be_selected() {
+        let mut d = dispatcher(SecurityConfig::default());
+        assert_eq!(
+            d.dispatch(ControlCommand::SelectDisplay { index: 0 }),
+            Ok(Effect::SelectDisplay(0))
+        );
+        assert_eq!(
+            d.dispatch(ControlCommand::SelectDisplay { index: 1 }),
+            Err(RejectReason::WrongState),
+            "un seul écran connu"
+        );
+
+        d.set_geometry(2560, 1440, 3);
+        assert_eq!(
+            d.dispatch(ControlCommand::SelectDisplay { index: 2 }),
+            Ok(Effect::SelectDisplay(2))
+        );
+        assert_eq!(
+            d.dispatch(ControlCommand::SelectDisplay { index: 3 }),
+            Err(RejectReason::WrongState)
+        );
+    }
+
+    #[test]
+    fn a_geometry_change_rescales_presets_and_keeps_the_rate_window() {
+        let mut d = Dispatcher::new(permissive(), 1920, 1080);
+        for _ in 0..RATE_LIMIT - 1 {
+            let _ = d.dispatch(ControlCommand::RequestStats);
+        }
+        d.set_geometry(3840, 2160, 1);
+        assert_eq!(
+            d.dispatch(ControlCommand::SetQuality {
+                preset: QualityPreset::Balanced
+            }),
+            Ok(Effect::Bitrate(32_000_000))
+        );
+        assert_eq!(
+            d.dispatch(ControlCommand::RequestStats),
+            Err(RejectReason::RateLimited),
+            "changer de géométrie ne doit pas effacer l'historique"
         );
     }
 

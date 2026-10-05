@@ -4,62 +4,97 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="theme-color" content="#0b0d10">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>sidgate</title>
 <link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <style>
   :root {
     --bg: #0b0d10;
     --panel: #14181e;
-    --line: #232a33;
+    --raised: #1b2129;
+    --line: #262e38;
     --text: #e6eaef;
     --muted: #8b97a6;
     --accent: #4da3ff;
     --danger: #ff6b6b;
     --ok: #5ad18f;
+    --warn: #f0b45a;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body {
     margin: 0; height: 100%; overflow: hidden;
     background: var(--bg); color: var(--text);
     font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
     -webkit-user-select: none; user-select: none;
     -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
   }
+
+  button {
+    font: inherit; font-weight: 550; color: var(--text);
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 11px 18px; cursor: pointer;
+    transition: border-color .15s, background .15s, color .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); color: #04070c; border-color: var(--accent); }
+  button.primary:hover:not(:disabled) { background: #6cb4ff; }
+  button.danger { color: var(--danger); }
+  button.danger:hover:not(:disabled) { border-color: var(--danger); }
+  button.link {
+    background: none; border: none; padding: 4px 6px;
+    color: var(--muted); font-weight: 450; font-size: 13px; text-decoration: underline;
+  }
+  button.link:hover:not(:disabled) { color: var(--text); }
 
   /* --- Écran d'accueil --- */
   #gate {
     position: fixed; inset: 0; z-index: 20;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 18px; padding: 24px; text-align: center;
-    background: var(--bg);
+    gap: 20px; text-align: center; background: var(--bg);
+    padding: calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom));
   }
-  #gate[hidden] { display: none; }
+  .brand { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .brand svg { width: 64px; height: 64px; }
   .mark { font-size: 30px; font-weight: 650; letter-spacing: -0.02em; }
   .mark span { color: var(--accent); }
-  #status { color: var(--muted); min-height: 1.4em; max-width: 34ch; }
+  #status { color: var(--muted); min-height: 2.9em; max-width: 36ch; margin: 0; }
   #status.error { color: var(--danger); }
-  #fingerprint {
-    font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
-    color: var(--muted); word-break: break-all; max-width: 34ch;
+  #status.busy::after {
+    content: ""; display: inline-block; width: .9em; height: .9em; margin-left: .5em;
+    vertical-align: -.1em; border-radius: 50%;
+    border: 2px solid var(--line); border-top-color: var(--accent);
+    animation: spin .8s linear infinite;
   }
-  button {
-    font: inherit; font-weight: 550; color: var(--text);
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 10px; padding: 11px 18px; cursor: pointer;
-    transition: border-color .15s, background .15s;
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  #pairing, #trust {
+    display: flex; flex-direction: column; gap: 12px; align-items: center; max-width: 36ch;
   }
-  button:hover:not(:disabled) { border-color: var(--accent); }
-  button:disabled { opacity: .45; cursor: default; }
-  button.primary { background: var(--accent); color: #04070c; border-color: var(--accent); }
+  #pairing label, #trust p { color: var(--text); margin: 0; }
   #code {
-    font: 600 22px/1 ui-monospace, Menlo, monospace; letter-spacing: .18em;
+    font: 600 22px/1 var(--mono); letter-spacing: .18em;
     text-align: center; text-transform: uppercase;
     width: 11ch; padding: 12px; color: var(--text);
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    -webkit-user-select: text; user-select: text;
   }
-  #pairing[hidden], #connect[hidden] { display: none; }
-  #pairing { display: flex; flex-direction: column; gap: 12px; align-items: center; }
+  #code:focus { outline: none; border-color: var(--accent); }
+  #identity {
+    display: grid; grid-template-columns: auto auto; gap: 2px 12px; margin: 0;
+    font: 12px/1.5 var(--mono); color: var(--muted); text-align: left;
+  }
+  #identity dt { text-align: right; }
+  #identity dd { margin: 0; color: var(--text); opacity: .8; }
+  #options { display: flex; flex-direction: column; align-items: center; gap: 2px; }
 
   /* --- Session --- */
   #stage { position: fixed; inset: 0; background: #000; display: none; }
@@ -68,89 +103,193 @@
     width: 100%; height: 100%; object-fit: contain;
     background: #000; display: block; touch-action: none;
   }
+  /* Tenu debout, l'image se cale en haut : le panneau s'ouvre dessous. Le
+     calcul de position du curseur, dans app.js, suit la même règle. */
+  @media (orientation: portrait) {
+    video { object-position: 50% 0; }
+    #notice { top: 22%; }
+  }
   #cursor {
-    position: absolute; width: 14px; height: 14px; margin: -1px 0 0 -1px;
-    pointer-events: none; opacity: .9; display: none;
+    position: absolute; left: 0; top: 0; pointer-events: none; display: none;
+    transform-origin: 0 0; image-rendering: auto;
   }
   #cursor.on { display: block; }
+  #notice {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    max-width: 34ch; padding: 14px 18px; border-radius: 12px; text-align: center;
+    background: rgba(20, 24, 30, .94); border: 1px solid var(--line); color: var(--text);
+  }
+  #details {
+    position: absolute; left: calc(10px + env(safe-area-inset-left));
+    top: calc(10px + env(safe-area-inset-top)); margin: 0; padding: 10px 12px;
+    font: 11px/1.55 var(--mono); color: var(--text); pointer-events: none;
+    background: rgba(11, 13, 16, .82); border: 1px solid var(--line); border-radius: 8px;
+    white-space: pre;
+  }
 
   #hud {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
-    display: flex; flex-direction: column; gap: 8px;
-    padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
-    background: linear-gradient(transparent, rgba(11,13,16,.92) 45%);
-    transform: translateY(calc(100% - 34px)); transition: transform .22s ease;
+    flex-direction: column; gap: 8px;
+    padding: 0 12px calc(10px + env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, rgba(11, 13, 16, .94) 34px);
+    transform: translateY(calc(100% - 30px)); transition: transform .22s ease;
+    max-height: 80vh; display: none;
   }
-  #hud.open { transform: translateY(0); }
+  #hud.on { display: flex; }
+  #hud.open { transform: translateY(0); overflow-y: auto; }
   #grip {
-    align-self: center; width: 42px; height: 4px; border-radius: 2px;
-    background: var(--muted); opacity: .6; margin-bottom: 6px;
+    align-self: center; width: 96px; height: 30px; padding: 0; flex: none;
+    background: none; border: none; border-radius: 0; position: relative;
   }
+  #grip::before {
+    content: ""; position: absolute; left: 27px; right: 27px; top: 13px; height: 4px;
+    border-radius: 2px; background: var(--muted); opacity: .7;
+  }
+  #grip:hover::before { background: var(--text); }
   .row { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
   .row button { padding: 7px 11px; font-size: 13px; border-radius: 8px; }
   .row button.on { border-color: var(--accent); color: var(--accent); }
+  .row .sep { width: 1px; background: var(--line); margin: 3px 4px; }
+  #badge {
+    align-self: center; padding: 2px 10px; border-radius: 999px; font-size: 12px;
+    color: var(--warn); border: 1px solid var(--warn);
+  }
   #telemetry {
     display: flex; gap: 14px; justify-content: center; flex-wrap: wrap;
-    font: 11px/1.4 ui-monospace, Menlo, monospace; color: var(--muted);
+    font: 11px/1.4 var(--mono); color: var(--muted); min-height: 1.4em;
   }
   #telemetry b { color: var(--text); font-weight: 600; }
+
   #toast {
     position: fixed; top: calc(12px + env(safe-area-inset-top)); left: 50%;
-    transform: translateX(-50%); z-index: 30;
-    padding: 8px 14px; border-radius: 8px; font-size: 13px;
-    background: var(--panel); border: 1px solid var(--line);
+    transform: translateX(-50%); z-index: 40; max-width: 90vw;
+    padding: 8px 14px; border-radius: 8px; font-size: 13px; text-align: center;
+    background: var(--raised); border: 1px solid var(--line);
     opacity: 0; transition: opacity .2s; pointer-events: none;
   }
   #toast.show { opacity: 1; }
+
+  dialog {
+    color: var(--text); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 20px; width: min(92vw, 440px);
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, .6); }
+  dialog h2 { margin: 0 0 8px; font-size: 17px; }
+  dialog p { margin: 0 0 14px; color: var(--muted); }
+  dialog textarea {
+    width: 100%; height: 130px; resize: vertical; padding: 10px;
+    font: 13px/1.4 var(--mono); color: var(--text);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    -webkit-user-select: text; user-select: text;
+  }
+  dialog textarea:focus { outline: none; border-color: var(--accent); }
+  dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+
+  #ime { position: fixed; left: -200px; top: 0; width: 100px; opacity: 0; pointer-events: none; }
 </style>
 </head>
 <body>
 
-<div id="gate">
-  <div class="mark">sid<span>gate</span></div>
-  <p id="status">Initialisation…</p>
+<main id="gate">
+  <div class="brand">
+    <svg viewBox="0 0 512 512" aria-hidden="true">
+      <path d="M256 104l112 48v98c0 72-46 126-112 158-66-32-112-86-112-158v-98z"
+            fill="#10161f" stroke="#4da3ff" stroke-width="22" stroke-linejoin="round"/>
+      <path d="M208 258l34 34 66-72" fill="none" stroke="#4da3ff" stroke-width="24"
+            stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <div class="mark">sid<span>gate</span></div>
+  </div>
 
-  <div id="connect" hidden>
-    <button id="unlock" class="primary">Déverrouiller et connecter</button>
+  <p id="status" role="status" aria-live="polite">Initialisation…</p>
+
+  <div id="actions">
+    <button id="unlock" class="primary" hidden>Se connecter</button>
+    <button id="cancel" hidden>Annuler</button>
   </div>
 
   <div id="pairing" hidden>
-    <p>Saisissez le code affiché sur la console de l'hôte.</p>
+    <label for="code">Saisissez le code affiché par l'hôte.</label>
     <input id="code" maxlength="9" autocomplete="off" autocapitalize="characters"
            spellcheck="false" inputmode="text" placeholder="····-····">
     <button id="pair" class="primary">Appairer cet appareil</button>
   </div>
 
-  <p id="fingerprint"></p>
-</div>
+  <div id="trust" hidden>
+    <p>Si l'hôte a été réinstallé, oubliez son ancienne identité puis appairez de nouveau.
+       Dans le doute, n'en faites rien : c'est aussi ce que verrait la victime d'une interception.</p>
+    <button id="forget" class="danger">Oublier l'hôte précédent</button>
+  </div>
+
+  <dl id="identity">
+    <dt>cet appareil</dt><dd id="device-fingerprint">—</dd>
+    <dt>hôte</dt><dd id="host-fingerprint">—</dd>
+  </dl>
+
+  <div id="options" hidden>
+    <button id="biometrics" class="link" hidden></button>
+  </div>
+</main>
 
 <div id="stage">
   <video id="screen" autoplay playsinline muted></video>
-  <svg id="cursor" viewBox="0 0 12 18" aria-hidden="true">
-    <path d="M1 1l10 9.5H6.2l2.6 5.6-2.1 1-2.6-5.7L1 14.6z"
-          fill="#fff" stroke="#000" stroke-width="1.1" stroke-linejoin="round"/>
-  </svg>
+  <canvas id="cursor" width="12" height="18" aria-hidden="true"></canvas>
+  <div id="notice" role="status" hidden></div>
+  <pre id="details" hidden></pre>
 </div>
 
 <div id="hud">
-  <div id="grip"></div>
+  <button id="grip" aria-label="Afficher ou masquer les commandes" aria-expanded="false"></button>
+  <div id="badge" hidden>lecture seule</div>
   <div class="row" id="shortcuts"></div>
-  <div class="row">
+  <div class="row" id="displays" hidden></div>
+  <div class="row" id="quality">
     <button data-quality="low">Éco</button>
-    <button data-quality="balanced" class="on">Équilibré</button>
+    <button data-quality="balanced">Équilibré</button>
     <button data-quality="high">Haute</button>
     <button data-quality="ultra">Ultra</button>
-    <button id="mode">Trackpad</button>
+  </div>
+  <div class="row">
+    <button id="mode"></button>
     <button id="keyboard">Clavier</button>
+    <button id="paste">Coller</button>
+    <button id="copy" hidden>Copier de l'hôte</button>
+    <button id="stats">Détails</button>
     <button id="fullscreen">Plein écran</button>
+  </div>
+  <div class="row">
     <button id="lock">Verrouiller</button>
+    <button id="sleep" data-power hidden>Veille</button>
+    <button id="reboot" data-power hidden>Redémarrer</button>
+    <button id="shutdown" data-power hidden class="danger">Éteindre</button>
+    <span class="sep"></span>
+    <button id="disconnect" class="danger">Déconnecter</button>
   </div>
   <div id="telemetry"></div>
 </div>
 
-<input id="ime" style="position:fixed;opacity:0;pointer-events:none;left:-100px"
-       autocomplete="off" autocapitalize="off" spellcheck="false">
-<div id="toast"></div>
+<dialog id="confirm">
+  <h2 id="confirm-title"></h2>
+  <p id="confirm-text"></p>
+  <div class="buttons">
+    <button id="confirm-no">Annuler</button>
+    <button id="confirm-yes" class="primary"></button>
+  </div>
+</dialog>
+
+<dialog id="clip">
+  <h2 id="clip-title"></h2>
+  <p id="clip-text"></p>
+  <textarea id="clip-area" spellcheck="false" autocomplete="off"></textarea>
+  <div class="buttons">
+    <button id="clip-close">Fermer</button>
+    <button id="clip-action" class="primary"></button>
+  </div>
+</dialog>
+
+<input id="ime" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+       enterkeyhint="enter" aria-hidden="true" tabindex="-1">
+<div id="toast" role="status"></div>
 
 <script type="module" src="/app.js"></script>
 </body>

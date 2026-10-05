@@ -8,27 +8,39 @@
 // clés — même du code exécuté sur cette page ne peut pas la lire, seulement
 // demander une signature. C'est ce qui rend le vol d'identité par script
 // impossible sans vol de l'appareil.
+//
+// Les calculs et les codecs vivent dans `core.js`, sans DOM, pour être testés
+// hors navigateur. Ce fichier-ci ne fait que relier la page à cette logique.
 
-import { toScancode, SHORTCUTS } from '/keymap.js';
-
-const PROTOCOL = 1;
-const NONCE_LEN = 32;
-
-const DOMAIN_AUTH = 'sidgate/auth/client/v1';
-const DOMAIN_PAIR = 'sidgate/pair/client/v1';
-const DOMAIN_AGENT = 'sidgate/auth/agent/v1';
+import { scancodeOf, toScancode, SHORTCUTS, MODIFIERS } from '/keymap.js';
+import {
+  PROTOCOL, NONCE_LEN, DOMAIN_AUTH, DOMAIN_PAIR, DOMAIN_AGENT, MAX_EVENTS_PER_FRAME,
+  toHex, fromHex, fromBase64, groupHex, transcript,
+  event as input, encodeFrame, coalesce, chunk, textToEvents, textDelta, wheelUnits,
+  decodePointer, SeqTracker, contentRect,
+  perUnitDelta, lossPercentDelta, estimateLatency, isStalled, reconnectDelay,
+} from '/core.js';
 
 // --- Éléments ---------------------------------------------------------------
 
 const $ = (id) => document.getElementById(id);
 const ui = {
-  gate: $('gate'), status: $('status'), fingerprint: $('fingerprint'),
-  connect: $('connect'), unlock: $('unlock'),
+  gate: $('gate'), status: $('status'), unlock: $('unlock'), cancel: $('cancel'),
   pairing: $('pairing'), code: $('code'), pair: $('pair'),
+  trust: $('trust'), forget: $('forget'),
+  deviceFingerprint: $('device-fingerprint'), hostFingerprint: $('host-fingerprint'),
+  options: $('options'), biometrics: $('biometrics'),
   stage: $('stage'), video: $('screen'), cursor: $('cursor'),
-  hud: $('hud'), grip: $('grip'), shortcuts: $('shortcuts'),
-  mode: $('mode'), keyboard: $('keyboard'), fullscreen: $('fullscreen'),
-  lock: $('lock'), telemetry: $('telemetry'), toast: $('toast'), ime: $('ime'),
+  notice: $('notice'), details: $('details'),
+  hud: $('hud'), grip: $('grip'), badge: $('badge'), shortcuts: $('shortcuts'),
+  displays: $('displays'), mode: $('mode'), keyboard: $('keyboard'),
+  paste: $('paste'), copy: $('copy'), stats: $('stats'), fullscreen: $('fullscreen'),
+  lock: $('lock'), disconnect: $('disconnect'), telemetry: $('telemetry'),
+  confirm: $('confirm'), confirmTitle: $('confirm-title'), confirmText: $('confirm-text'),
+  confirmYes: $('confirm-yes'), confirmNo: $('confirm-no'),
+  clip: $('clip'), clipTitle: $('clip-title'), clipText: $('clip-text'),
+  clipArea: $('clip-area'), clipAction: $('clip-action'), clipClose: $('clip-close'),
+  toast: $('toast'), ime: $('ime'),
 };
 
 // --- Magasin local ----------------------------------------------------------
@@ -64,37 +76,14 @@ async function dbPut(key, value) {
   });
 }
 
-// --- Encodage ---------------------------------------------------------------
-
-const toHex = (bytes) =>
-  Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, '0')).join('');
-
-const fromHex = (hex) => {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i += 1) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return out;
-};
-
-/**
- * Reconstruit exactement la transcription que l'agent signe et vérifie.
- *
- * Chaque champ est préfixé de sa longueur sur 32 bits en petit-boutiste. Sans
- * ce préfixe, deux découpages différents des mêmes octets donneraient la même
- * transcription et une signature vaudrait pour les deux.
- */
-function transcript(domain, serverNonce, clientNonce, clientKey) {
-  const parts = [new TextEncoder().encode(domain), serverNonce, clientNonce, clientKey];
-  const total = parts.reduce((n, p) => n + 4 + p.length, 0);
-  const out = new Uint8Array(total);
-  const view = new DataView(out.buffer);
-  let offset = 0;
-  for (const part of parts) {
-    view.setUint32(offset, part.length, true);
-    offset += 4;
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
+async function dbDelete(key) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
 }
 
 // --- Identité ---------------------------------------------------------------
@@ -141,13 +130,13 @@ const randomNonce = () => crypto.getRandomValues(new Uint8Array(NONCE_LEN));
  * Exige une vérification de l'utilisateur avant d'ouvrir la session.
  *
  * S'appuie sur l'authentificateur de la plateforme : Face ID, empreinte, ou
- * Windows Hello. Indisponible lorsque la page est servie sous un certificat
- * auto-signé que le navigateur a signalé — dans ce cas on le dit franchement
- * plutôt que de laisser croire à une protection qui n'existe pas.
+ * Windows Hello. C'est une protection de l'appareil, pas de l'hôte : elle
+ * empêche quelqu'un qui tient le téléphone déverrouillé d'ouvrir la session.
+ * Elle ne s'active que sur demande, depuis l'écran d'accueil.
  */
 async function requireUserPresence() {
   const credentialId = await dbGet('webauthn');
-  if (!credentialId) return { ok: true, reason: 'non configuré' };
+  if (!credentialId) return { ok: true };
   try {
     const assertion = await navigator.credentials.get({
       publicKey: {
@@ -157,24 +146,29 @@ async function requireUserPresence() {
         timeout: 60000,
       },
     });
-    return { ok: Boolean(assertion), reason: 'vérifié' };
+    return { ok: Boolean(assertion) };
   } catch (e) {
-    return { ok: false, reason: e.name === 'NotAllowedError' ? 'refusé' : String(e.message) };
+    return { ok: false, reason: e.name === 'NotAllowedError' ? 'refusée' : 'indisponible' };
   }
 }
 
-async function enrollBiometrics(publicKeyHex) {
-  if (!window.PublicKeyCredential) return;
+async function biometricsAvailable() {
   try {
-    const available =
-      await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
-    if (!available) return;
+    return Boolean(window.PublicKeyCredential)
+      && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  } catch {
+    return false;
+  }
+}
+
+async function enrollBiometrics() {
+  try {
     const credential = await navigator.credentials.create({
       publicKey: {
         challenge: randomNonce(),
         rp: { name: 'sidgate', id: location.hostname },
         user: {
-          id: fromHex(publicKeyHex.slice(0, 32)),
+          id: fromHex(state.identity.publicKeyHex.slice(0, 32)),
           name: 'sidgate',
           displayName: 'Accès distant sidgate',
         },
@@ -187,40 +181,80 @@ async function enrollBiometrics(publicKeyHex) {
         timeout: 60000,
       },
     });
-    if (credential) {
-      await dbPut('webauthn', credential.rawId);
-      toast('Déverrouillage biométrique activé');
-    }
-  } catch {
-    // Facultatif par nature : un échec ne doit pas bloquer l'appairage.
+    if (!credential) return;
+    await dbPut('webauthn', credential.rawId);
+    toast('La biométrie sera demandée à chaque connexion');
+  } catch (e) {
+    // Une adresse IP ne peut pas servir d'identifiant de site à WebAuthn : la
+    // biométrie n'existe que derrière un nom de domaine.
+    toast(e.name === 'SecurityError'
+      ? 'Biométrie indisponible à cette adresse : il faut un nom de domaine'
+      : 'Biométrie non activée');
   }
+  refreshOptions();
 }
 
-// --- Session ----------------------------------------------------------------
+async function refreshOptions() {
+  const paired = Boolean(await dbGet('agent'));
+  const enrolled = Boolean(await dbGet('webauthn'));
+  const available = await biometricsAvailable();
+  ui.biometrics.hidden = !(paired && (available || enrolled));
+  ui.biometrics.textContent = enrolled
+    ? 'Ne plus exiger la biométrie à la connexion'
+    : 'Exiger la biométrie à la connexion';
+  ui.options.hidden = ui.biometrics.hidden;
+}
+
+// --- État -------------------------------------------------------------------
 
 const state = {
+  identity: null,
+  /** Incrémenté à chaque tentative : un rappel d'une tentative passée s'ignore. */
+  run: 0,
   socket: null,
   peer: null,
   input: null,
   control: null,
-  identity: null,
   serverNonce: null,
   clientNonce: null,
-  absolute: false,
+  agentKey: null,
   live: false,
-  cursor: { x: 0.5, y: 0.5 },
+  /** La session a-t-elle été établie depuis le dernier geste de l'utilisateur ? */
+  wasLive: false,
+  attempt: 0,
+  retryTimer: null,
+  /** Motif de fin annoncé par l'agent ou choisi par l'utilisateur. */
+  cause: null,
+  caps: null,
   desktop: { width: 1920, height: 1080 },
-  seq: 0,
+  absolute: matchMedia('(pointer: fine)').matches,
+  quality: null,
+  // Curseur : position en pixels du bureau, coin haut-gauche de l'image.
+  pointer: { x: 0, y: 0, visible: false, known: false },
+  shape: { width: 12, height: 18, hotX: 0, hotY: 0, blank: false, custom: false },
+  cursorUrl: null,
+  pointerSeq: new SeqTracker(),
+  seqLossy: 0,
+  seqReliable: 0,
   pending: [],
   flushScheduled: false,
+  held: new Set(),
+  sticky: new Set(),
   statsTimer: null,
   rtcPrevious: null,
   rtc: null,
+  agentStats: null,
+  stalls: 0,
+  showDetails: false,
+  /** L'utilisateur a-t-il manipulé le panneau ? Il ne se replie alors plus seul. */
+  hudTouched: false,
+  wakeLock: null,
 };
 
-function setStatus(text, isError = false) {
+function setStatus(text, { error = false, busy = false } = {}) {
   ui.status.textContent = text;
-  ui.status.classList.toggle('error', isError);
+  ui.status.classList.toggle('error', error);
+  ui.status.classList.toggle('busy', busy);
 }
 
 let toastTimer;
@@ -228,32 +262,72 @@ function toast(text) {
   ui.toast.textContent = text;
   ui.toast.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => ui.toast.classList.remove('show'), 2200);
+  toastTimer = setTimeout(() => ui.toast.classList.remove('show'), 2600);
 }
 
+/** Demande une confirmation et renvoie la réponse. */
+function confirmAction(title, text, action) {
+  ui.confirmTitle.textContent = title;
+  ui.confirmText.textContent = text;
+  ui.confirmYes.textContent = action;
+  ui.confirm.showModal();
+  return new Promise((resolve) => {
+    const done = (answer) => {
+      ui.confirm.close();
+      ui.confirmYes.onclick = null;
+      ui.confirmNo.onclick = null;
+      ui.confirm.oncancel = null;
+      resolve(answer);
+    };
+    ui.confirmYes.onclick = () => done(true);
+    ui.confirmNo.onclick = () => done(false);
+    ui.confirm.oncancel = () => done(false);
+  });
+}
+
+// --- Connexion --------------------------------------------------------------
+
 async function connect() {
-  setStatus('Connexion…');
-  ui.connect.hidden = true;
+  clearTimeout(state.retryTimer);
+  state.retryTimer = null;
+  const run = ++state.run;
+  state.cause = null;
+  ui.unlock.hidden = true;
+  ui.cancel.hidden = false;
+  ui.pairing.hidden = true;
+  ui.trust.hidden = true;
+  setStatus('Connexion…', { busy: true });
 
   const presence = await requireUserPresence();
+  if (run !== state.run) return;
   if (!presence.ok) {
-    setStatus(`Déverrouillage ${presence.reason}.`, true);
-    ui.connect.hidden = false;
+    finish('refused', `Vérification biométrique ${presence.reason}.`);
     return;
   }
 
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   const socket = new WebSocket(`${scheme}://${location.host}/ws`);
-  socket.binaryType = 'arraybuffer';
   state.socket = socket;
 
-  socket.onerror = () => setStatus('Connexion impossible.', true);
-  socket.onclose = () => endSession('Connexion fermée.');
-  socket.onmessage = (event) => handleServerMessage(JSON.parse(event.data));
+  socket.onmessage = (message) => {
+    if (run !== state.run) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(message.data);
+    } catch {
+      return;
+    }
+    handleServerMessage(parsed).catch((e) => finish('error', `Erreur : ${e.message}`));
+  };
+  socket.onclose = () => {
+    if (run !== state.run) return;
+    finish(state.cause ?? 'lost', state.wasLive ? 'Connexion perdue.' : 'Hôte injoignable.');
+  };
 }
 
 function send(type, payload) {
-  state.socket?.send(JSON.stringify(payload === undefined ? { type } : { type, payload }));
+  if (state.socket?.readyState !== WebSocket.OPEN) return;
+  state.socket.send(JSON.stringify(payload === undefined ? { type } : { type, payload }));
 }
 
 async function handleServerMessage({ type, payload }) {
@@ -268,33 +342,30 @@ async function handleServerMessage({ type, payload }) {
         sdpMid: payload.sdp_mid,
         sdpMLineIndex: payload.sdp_mline_index,
       }).catch(() => {});
-    case 'error': return setStatus(payload.message, true);
+    case 'closed': return onClosed(payload);
+    case 'error': return finish('error', payload.message);
     default: return undefined;
   }
 }
 
 async function onChallenge(payload) {
   if (payload.protocol !== PROTOCOL) {
-    setStatus('Version de protocole incompatible avec l’agent.', true);
+    finish('refused', 'Cette page ne correspond pas à la version de l’hôte. Rechargez-la.');
     return;
   }
 
   state.serverNonce = fromHex(payload.server_nonce);
   state.clientNonce = randomNonce();
+  state.agentKey = payload.agent_key;
+  ui.hostFingerprint.textContent = groupHex(payload.agent_key);
 
   const pinned = await dbGet('agent');
   if (pinned && pinned !== payload.agent_key) {
     // L'agent auquel nous avons été appairés n'est pas celui qui répond.
-    setStatus(
-      'L’identité de l’hôte a changé. Connexion interrompue par précaution.',
-      true,
-    );
-    state.socket.close();
+    finish('refused', 'L’identité de l’hôte a changé. Connexion interrompue par précaution.');
+    ui.trust.hidden = false;
     return;
   }
-
-  ui.fingerprint.textContent = `hôte ${groupHex(payload.agent_key)}`;
-  state.agentKey = payload.agent_key;
 
   if (pinned) {
     const data = transcript(
@@ -306,20 +377,23 @@ async function onChallenge(payload) {
       client_nonce: toHex(state.clientNonce),
       signature: await sign(state.identity.keys.privateKey, data),
     });
-    setStatus('Authentification…');
+    setStatus('Authentification…', { busy: true });
   } else if (payload.pairing_open) {
     setStatus('Cet appareil n’est pas encore appairé.');
     ui.pairing.hidden = false;
+    ui.pair.disabled = false;
+    ui.code.value = '';
     ui.code.focus();
   } else {
-    setStatus('Aucun appairage ouvert. Tapez « p » sur la console de l’hôte.', true);
+    finish('refused',
+      'Aucun appairage ouvert. Lancez « sidgate pair » sur l’hôte, puis reconnectez-vous.');
   }
 }
 
 async function submitPairing() {
   const code = ui.code.value.trim();
   if (code.replace(/[^a-z0-9]/gi, '').length !== 8) {
-    setStatus('Le code compte huit caractères.', true);
+    setStatus('Le code compte huit caractères.', { error: true });
     return;
   }
   ui.pair.disabled = true;
@@ -335,7 +409,7 @@ async function submitPairing() {
     signature: await sign(state.identity.keys.privateKey, data),
     label: deviceLabel(),
   });
-  setStatus('Appairage…');
+  setStatus('Appairage…', { busy: true });
 }
 
 async function onAuthOk(payload) {
@@ -345,26 +419,17 @@ async function onAuthOk(payload) {
   const verified = await verifyAgent(state.agentKey, payload.agent_signature, data);
 
   if (verified === false) {
-    setStatus('L’hôte n’a pas prouvé son identité. Connexion abandonnée.', true);
-    state.socket.close();
+    finish('refused', 'L’hôte n’a pas prouvé son identité. Connexion abandonnée.');
     return;
   }
   if (verified === null) {
     toast('Ce navigateur ne sait pas vérifier la signature de l’hôte');
   }
 
-  const firstTime = !(await dbGet('agent'));
   await dbPut('agent', state.agentKey);
-
   ui.pairing.hidden = true;
-  setStatus('Négociation du flux…');
+  setStatus('Négociation du flux…', { busy: true });
   await startWebrtc();
-
-  // Proposé après le démarrage du flux, et sans l'attendre : l'invite
-  // biométrique peut rester ouverte jusqu'à une minute, et la bloquer ici
-  // retardait d'autant la première image — 23 s mesurées quand personne n'y
-  // répondait.
-  if (firstTime) enrollBiometrics(state.identity.publicKeyHex);
 }
 
 function onAuthFailed({ reason }) {
@@ -372,36 +437,57 @@ function onAuthFailed({ reason }) {
     rejected: 'Identité ou code refusé.',
     pairing_closed: 'Aucun appairage ouvert sur l’hôte.',
     rate_limited: 'Trop de tentatives. Patientez une minute.',
-    protocol_mismatch: 'Version de protocole incompatible.',
+    protocol_mismatch: 'Cette page ne correspond pas à la version de l’hôte. Rechargez-la.',
     unexpected_message: 'Échange inattendu.',
   };
-  setStatus(messages[reason] ?? 'Authentification refusée.', true);
-  ui.pair.disabled = false;
+  finish('refused', messages[reason] ?? 'Authentification refusée.');
+}
+
+function onClosed({ reason }) {
+  const messages = {
+    replaced: 'Session reprise par un autre de vos appareils.',
+    busy: 'L’hôte reçoit trop de connexions. Réessayez dans un instant.',
+  };
+  finish(reason, messages[reason] ?? 'Session fermée par l’hôte.');
 }
 
 // --- WebRTC -----------------------------------------------------------------
 
 async function startWebrtc() {
+  const run = state.run;
   const peer = new RTCPeerConnection({ iceServers: [], bundlePolicy: 'max-bundle' });
   state.peer = peer;
 
   peer.addTransceiver('video', { direction: 'recvonly' });
 
-  // Temps réel : ni ordre ni retransmission. Une trame d'entrée perdue vaut
-  // mieux qu'une trame en retard — la suivante corrige déjà la position.
+  // Temps réel : ni ordre ni retransmission. Un mouvement perdu vaut mieux
+  // qu'un mouvement en retard — le suivant corrige déjà la position. L'agent
+  // y renvoie la position réelle du curseur, sous les mêmes garanties.
   state.input = peer.createDataChannel('input-raw', { ordered: false, maxRetransmits: 0 });
-  state.control = peer.createDataChannel('control-secure', { ordered: true });
-  state.control.onmessage = (event) => handleControlEvent(JSON.parse(event.data));
+  state.input.binaryType = 'arraybuffer';
+  state.input.onmessage = (message) => onPointerUpdate(message.data);
 
-  peer.ontrack = (event) => {
-    ui.video.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+  // Fiable et ordonné : commandes en texte, appuis et saisie en binaire.
+  state.control = peer.createDataChannel('control-secure', { ordered: true });
+  state.control.binaryType = 'arraybuffer';
+  state.control.onmessage = (message) => {
+    if (typeof message.data !== 'string') return;
+    try {
+      handleControlEvent(JSON.parse(message.data));
+    } catch {
+      // Un événement illisible ne doit pas interrompre la session.
+    }
+  };
+
+  peer.ontrack = (track) => {
+    ui.video.srcObject = track.streams[0] ?? new MediaStream([track.track]);
 
     // Par défaut le navigateur retient les images dans un tampon de gigue pour
     // lisser la lecture — le bon choix pour une visioconférence, le mauvais
     // pour piloter un bureau. Mesuré avant ce réglage : 94 à 175 ms de tampon,
     // soit l'essentiel de la latence. `jitterBufferTarget` est l'API standard ;
     // `playoutDelayHint` est l'ancienne forme propre à Chrome.
-    const receiver = event.receiver;
+    const receiver = track.receiver;
     if (receiver && 'jitterBufferTarget' in receiver) {
       receiver.jitterBufferTarget = 0;
     } else if (receiver && 'playoutDelayHint' in receiver) {
@@ -417,9 +503,10 @@ async function startWebrtc() {
     });
   };
   peer.onconnectionstatechange = () => {
+    if (run !== state.run) return;
     if (peer.connectionState === 'connected') beginSession();
     if (['failed', 'disconnected', 'closed'].includes(peer.connectionState)) {
-      endSession('Transport perdu.');
+      finish(state.cause ?? 'lost', 'Transport perdu.');
     }
   };
 
@@ -429,35 +516,127 @@ async function startWebrtc() {
 }
 
 function beginSession() {
+  if (state.live) return;
   state.live = true;
+  state.wasLive = true;
+  state.attempt = 0;
   state.rtcPrevious = null;
   state.rtc = null;
+  state.agentStats = null;
+  state.stalls = 0;
+  state.pointerSeq = new SeqTracker();
+  state.pointer.known = false;
+  state.hudTouched = false;
+  resetShape();
+
   clearInterval(state.statsTimer);
   state.statsTimer = setInterval(sampleRtcStats, 2000);
+
   ui.gate.hidden = true;
   ui.stage.classList.add('live');
-  ui.cursor.classList.add('on');
-  ui.hud.classList.add('open');
-  setTimeout(() => ui.hud.classList.remove('open'), 2600);
-  drawCursor();
+  ui.hud.classList.add('on');
+  setHud(true);
+  setTimeout(() => { if (state.live && !state.hudTouched) setHud(false); }, 3200);
+  renderMode();
+  renderCursor();
+  acquireWakeLock();
 }
 
-function endSession(message) {
-  if (!state.live && ui.gate.hidden === false) setStatus(message, true);
+/**
+ * Termine la tentative ou la session en cours et revient à l'écran d'accueil.
+ *
+ * @param {string} cause  `lost` pour une coupure subie, qui peut se retenter ;
+ *   tout autre motif rend la main à l'utilisateur.
+ * @param {string} message  Texte à afficher.
+ */
+function finish(cause, message) {
+  const wasLive = state.live;
+  state.run += 1;
   state.live = false;
   clearInterval(state.statsTimer);
   state.statsTimer = null;
-  ui.stage.classList.remove('live');
-  ui.cursor.classList.remove('on');
-  ui.gate.hidden = false;
-  ui.connect.hidden = false;
-  ui.pair.disabled = false;
-  setStatus(message, true);
+  releaseEverything();
+
+  const socket = state.socket;
+  state.socket = null;
+  if (socket && socket.readyState <= WebSocket.OPEN) socket.close();
   state.peer?.close();
   state.peer = null;
+  state.input = null;
+  state.control = null;
+  state.caps = null;
+  state.pending = [];
+
+  if (document.pointerLockElement) document.exitPointerLock();
+  state.wakeLock?.release().catch(() => {});
+  state.wakeLock = null;
+  ui.video.srcObject = null;
+  ui.stage.classList.remove('live');
+  ui.hud.classList.remove('on', 'open');
+  ui.notice.hidden = true;
+  ui.gate.hidden = false;
+  ui.pairing.hidden = true;
+  ui.cancel.hidden = true;
+  for (const dialog of [ui.confirm, ui.clip]) if (dialog.open) dialog.close();
+  refreshOptions();
+
+  // Une coupure subie en pleine session se retente toute seule ; avec la
+  // biométrie activée, chaque tentative ouvrirait une invite : on s'abstient.
+  const delay = wasLive || state.attempt > 0 ? reconnectDelay(cause, state.attempt) : null;
+  if (delay !== null) {
+    dbGet('webauthn').then((credential) => {
+      if (credential || state.live || state.socket) {
+        idle(message);
+        return;
+      }
+      state.attempt += 1;
+      setStatus(`${message} Nouvelle tentative…`, { busy: true });
+      ui.unlock.hidden = true;
+      ui.cancel.hidden = false;
+      state.retryTimer = setTimeout(connect, delay);
+    });
+    return;
+  }
+  idle(message, cause !== 'left');
 }
 
-// --- Latence ----------------------------------------------------------------
+/** Rend la main à l'utilisateur, bouton de connexion affiché. */
+function idle(message, error = true) {
+  state.attempt = 0;
+  state.wasLive = false;
+  setStatus(message, { error });
+  ui.unlock.hidden = false;
+  ui.cancel.hidden = true;
+}
+
+function cancel() {
+  clearTimeout(state.retryTimer);
+  state.retryTimer = null;
+  state.cause = 'left';
+  finish('left', 'Prêt.');
+}
+
+function disconnect() {
+  state.cause = 'left';
+  send('bye');
+  finish('left', 'Déconnecté.');
+}
+
+async function acquireWakeLock() {
+  // Un téléphone qui s'éteint au bout de trente secondes sans toucher l'écran
+  // couperait la session en plein visionnage.
+  try {
+    state.wakeLock = await navigator.wakeLock?.request('screen');
+  } catch {
+    // Refusé en économie d'énergie : sans conséquence.
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.live) acquireWakeLock();
+});
+
+// --- Télémétrie -------------------------------------------------------------
 
 /**
  * Relève les statistiques WebRTC du récepteur vidéo.
@@ -511,60 +690,56 @@ async function sampleRtcStats() {
     rttMs: rttSeconds === null ? null : rttSeconds * 1000,
     lossPercent: lossPercentDelta(current, previous),
   };
-}
 
-/**
- * Moyenne par unité sur l'intervalle, mise à l'échelle.
- *
- * Renvoie `null` si une valeur manque ou si aucune unité n'est passée dans
- * l'intervalle. La multiplication se fait ici, après ce test, et non sur le
- * résultat : en JavaScript `null * 1000` vaut 0, et c'est exactement par là
- * qu'une absence de mesure devenait un « 0,0 ms » affiché.
- */
-function perUnitDelta(valueNow, valueBefore, countNow, countBefore, scale) {
-  if ([valueNow, valueBefore, countNow, countBefore].includes(null)) return null;
-  const count = countNow - countBefore;
-  if (count <= 0) return null;
-  return ((valueNow - valueBefore) / count) * scale;
-}
-
-/** Part de paquets perdus sur l'intervalle, en pourcentage, ou `null`. */
-function lossPercentDelta(current, previous) {
-  if ([current.lost, previous.lost, current.received, previous.received].includes(null)) {
-    return null;
+  // Filet : le décodeur attend une image clé que personne ne lui envoie.
+  state.stalls = isStalled(current, previous) ? state.stalls + 1 : 0;
+  if (state.stalls >= 2) {
+    state.stalls = 0;
+    command('request_keyframe');
   }
-  const lost = Math.max(0, current.lost - previous.lost);
-  const total = lost + (current.received - previous.received);
-  return total > 0 ? (lost / total) * 100 : null;
 }
 
-/**
- * Latence estimée du pipeline, en millisecondes.
- *
- * Somme de ce que l'on sait mesurer : capture et encodage côté hôte, trajet
- * aller (la moitié de l'aller-retour), attente dans le tampon de gigue, et
- * décodage. N'y figurent pas l'attente de présentation du compositeur de l'hôte
- * ni la synchronisation verticale de l'écran client — jusqu'à une image chacune
- * à 60 Hz. C'est donc une borne basse, et elle est affichée comme telle.
- */
-function estimateLatencyMs(encodeMs) {
-  const rtc = state.rtc;
-  const terms = {
-    encodeMs: typeof encodeMs === 'number' && encodeMs > 0 ? encodeMs : null,
-    networkMs: rtc && rtc.rttMs !== null ? rtc.rttMs / 2 : null,
-    jitterMs: rtc ? rtc.jitterMs : null,
-    decodeMs: rtc ? rtc.decodeMs : null,
-  };
-  const known = Object.values(terms).filter((value) => value !== null);
-  if (known.length === 0) return null;
-  return {
-    ...terms,
-    // Somme des seuls termes mesurés : une borne basse, d'autant plus basse
-    // qu'il en manque. `complete` le signale à l'affichage.
-    total: known.reduce((sum, value) => sum + value, 0),
-    complete: known.length === Object.keys(terms).length,
-    lossPercent: rtc ? rtc.lossPercent : null,
-  };
+function renderTelemetry(stats) {
+  state.agentStats = stats;
+  const latency = estimateLatency(stats.encode_ms, state.rtc, stats.rtt_ms);
+  const mbps = (stats.bitrate_bps / 1e6).toFixed(1);
+  // Uniquement des nombres formatés : aucune chaîne venue du réseau n'est
+  // insérée ici, d'où l'usage acceptable d'innerHTML pour la mise en forme.
+  ui.telemetry.innerHTML = [
+    latency ? `<span><b>≥${latency.total.toFixed(0)}</b> ms${latency.complete ? '' : '*'}</span>` : '',
+    `<span><b>${Number(stats.fps).toFixed(0)}</b> i/s</span>`,
+    `<span><b>${mbps}</b> Mbit/s</span>`,
+    latency && latency.lossPercent !== null && latency.lossPercent >= 0.1
+      ? `<span><b>${latency.lossPercent.toFixed(1)}</b> % pertes</span>` : '',
+  ].filter(Boolean).join('');
+  renderDetails(latency);
+}
+
+function renderDetails(latency) {
+  ui.details.hidden = !state.showDetails;
+  if (!state.showDetails) return;
+  const stats = state.agentStats;
+  const ms = (value) => (value === null || value === undefined ? 'n/d' : `${value.toFixed(1)} ms`);
+  const lines = [
+    `bureau      ${state.desktop.width}×${state.desktop.height}`,
+    `encodage    ${ms(latency?.encodeMs)}`,
+    `réseau      ${ms(latency?.networkMs)}`,
+    `gigue       ${ms(latency?.jitterMs)}`,
+    `décodage    ${ms(latency?.decodeMs)}`,
+    `latence     ${latency ? `≥ ${latency.total.toFixed(0)} ms` : 'n/d'}${latency && !latency.complete ? ' (incomplète)' : ''}`,
+    '            hors présentation et synchro verticale',
+  ];
+  if (stats) {
+    const optional = (value, digits, unit) =>
+      (typeof value === 'number' ? `${value.toFixed(digits)} ${unit}` : 'n/d');
+    lines.push(
+      `cadence     ${Number(stats.fps).toFixed(0)} i/s, ${stats.frames_dropped} écartées`,
+      `débit       ${(stats.bitrate_bps / 1e6).toFixed(2)} Mbit/s`,
+      `pertes      ${latency?.lossPercent === null || latency?.lossPercent === undefined ? 'n/d' : `${latency.lossPercent.toFixed(1)} %`}`,
+      `hôte        ${optional(stats.cpu_percent, 1, '% CPU')}, ${optional(stats.rss_mb, 0, 'Mo')}`,
+    );
+  }
+  ui.details.textContent = lines.join('\n');
 }
 
 // --- Canal de contrôle ------------------------------------------------------
@@ -574,327 +749,775 @@ function command(cmd, args) {
   state.control.send(JSON.stringify(args === undefined ? { cmd } : { cmd, args }));
 }
 
-function handleControlEvent(event) {
-  switch (event.evt) {
+function handleControlEvent(message) {
+  switch (message.evt) {
     case 'hello':
-      state.desktop = {
-        width: event.capabilities.width,
-        height: event.capabilities.height,
-      };
-      ui.lock.hidden = false;
+      onHello(message.capabilities);
       break;
     case 'stats':
-      renderTelemetry(event);
+      renderTelemetry(message);
       break;
     case 'command_rejected':
-      toast(`« ${event.command} » refusé (${event.reason})`);
+      toast(rejection(message.command, message.reason));
       break;
     case 'capture_unavailable':
       // La session reste ouverte : seule la vidéo manque, et elle revient
       // d'elle-même. Fermer la connexion obligerait à tout renégocier.
-      toast(event.message);
-      ui.telemetry.textContent = event.message;
+      ui.notice.textContent = `${message.message}. La vidéo reprendra d’elle-même.`;
+      ui.notice.hidden = false;
       break;
     case 'capture_resumed':
-      toast('Capture reprise');
-      ui.telemetry.textContent = '';
+      ui.notice.hidden = true;
       break;
     case 'display_changed':
-      state.desktop = { width: event.width, height: event.height };
+      state.desktop = { width: message.width, height: message.height };
+      renderCursor();
+      break;
+    case 'pointer_shape':
+      onPointerShape(message);
+      break;
+    case 'clipboard':
+      onHostClipboard(message);
       break;
     case 'ping':
-      command('pong', { seq: event.seq });
+      command('pong', { seq: message.seq });
       break;
     default:
       break;
   }
 }
 
-function renderTelemetry(stats) {
-  const mbps = (stats.bitrate_bps / 1e6).toFixed(1);
-  const latency = estimateLatencyMs(stats.encode_ms);
-  // Uniquement des nombres formatés : aucune chaîne venue du réseau n'est
-  // insérée ici, d'où l'usage acceptable d'innerHTML pour la mise en forme.
-  ui.telemetry.innerHTML = [
-    latency ? `<b>≥${latency.total.toFixed(0)}</b> ms lat.${latency.complete ? '' : '*'}` : '',
-    `<b>${stats.fps.toFixed(0)}</b> i/s`,
-    `<b>${mbps}</b> Mbit/s`,
-    latency && latency.lossPercent !== null && latency.lossPercent >= 0.1
-      ? `<b>${latency.lossPercent.toFixed(1)}</b> % pertes` : '',
-    stats.frames_dropped ? `<b>${stats.frames_dropped}</b> écartées` : '',
-  ].filter(Boolean).join('');
-  const term = (value) => (value === null ? 'n/d' : `${value.toFixed(1)} ms`);
-  ui.telemetry.title = latency
-    ? `encodage ${term(latency.encodeMs)} · réseau ${term(latency.networkMs)} · `
-      + `gigue ${term(latency.jitterMs)} · décodage ${term(latency.decodeMs)} — `
-      + 'borne basse, hors présentation et synchronisation verticale'
-      + (latency.complete ? '' : ' ; * termes non mesurés par ce navigateur exclus')
-    : 'mesure de latence en cours';
+function rejection(name, reason) {
+  const names = {
+    lock: 'Verrouillage', sleep: 'Mise en veille', reboot: 'Redémarrage', shutdown: 'Extinction',
+    set_quality: 'Changement de qualité', select_display: 'Changement d’écran',
+    request_clipboard: 'Lecture du presse-papiers', request_keyframe: 'Rafraîchissement',
+  };
+  const reasons = {
+    not_permitted: 'refusé par la configuration de l’hôte',
+    rate_limited: 'trop de commandes, patientez',
+    wrong_state: 'impossible pour l’instant',
+    failed: 'échec sur l’hôte',
+    malformed: 'commande non reconnue',
+  };
+  return `${names[name] ?? 'Commande'} : ${reasons[reason] ?? 'refusé'}`;
 }
 
-// --- Entrées ----------------------------------------------------------------
+function onHello(caps) {
+  state.caps = caps;
+  state.desktop = { width: caps.width, height: caps.height };
+  state.quality = caps.quality;
+  ui.notice.hidden = true;
+  renderMode();
 
-const EVENT = {
-  MOVE_REL: 0x01, MOVE_ABS: 0x02, BUTTON: 0x03, SCROLL: 0x04, KEY: 0x05,
-};
+  ui.badge.hidden = caps.input_injection;
+  ui.copy.hidden = !caps.clipboard;
+  for (const element of document.querySelectorAll('[data-power]')) {
+    element.hidden = !caps.power_actions;
+  }
 
-function queue(bytes) {
-  if (state.input?.readyState !== 'open') return;
+  ui.displays.hidden = caps.displays.length < 2;
+  ui.displays.replaceChildren(...caps.displays.map((display, position) => {
+    const element = document.createElement('button');
+    element.textContent = `Écran ${position + 1}${display.primary ? ' ★' : ''}`;
+    element.title = `${display.width}×${display.height}`;
+    element.classList.toggle('on', display.index === caps.display);
+    element.onclick = () => command('select_display', { index: display.index });
+    return element;
+  }));
+  renderCursor();
+}
+
+// --- Presse-papiers ---------------------------------------------------------
+
+async function onHostClipboard({ text, truncated }) {
+  if (!text) {
+    toast('Le presse-papiers de l’hôte ne contient pas de texte');
+    return;
+  }
+  const suffix = truncated ? ' (tronqué)' : '';
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`Presse-papiers de l’hôte copié${suffix}`);
+  } catch {
+    // Le navigateur exige un geste récent pour écrire dans le presse-papiers ;
+    // la réponse de l'hôte est arrivée trop tard pour compter comme tel.
+    openClipDialog({
+      title: `Presse-papiers de l’hôte${suffix}`,
+      text: 'Votre navigateur demande une confirmation pour copier ce texte.',
+      value: text,
+      action: 'Copier',
+      onAction: async (value) => {
+        await navigator.clipboard.writeText(value).catch(() => {});
+        toast('Copié');
+      },
+    });
+  }
+}
+
+async function pasteToHost() {
+  let text = null;
+  try {
+    text = await navigator.clipboard.readText();
+  } catch {
+    // Lecture refusée ou non proposée par ce navigateur : saisie manuelle.
+  }
+  if (text) {
+    typeText(text);
+    return;
+  }
+  openClipDialog({
+    title: 'Coller sur l’hôte',
+    text: 'Collez ici le texte à saisir sur l’hôte.',
+    value: '',
+    action: 'Envoyer',
+    onAction: (value) => typeText(value),
+  });
+}
+
+function openClipDialog({ title, text, value, action, onAction }) {
+  ui.clipTitle.textContent = title;
+  ui.clipText.textContent = text;
+  ui.clipArea.value = value;
+  ui.clipAction.textContent = action;
+  ui.clipAction.onclick = async () => {
+    await onAction(ui.clipArea.value);
+    ui.clip.close();
+  };
+  ui.clip.showModal();
+  ui.clipArea.focus();
+  ui.clipArea.select();
+}
+
+/** Longueur maximale d'un texte tapé d'un coup sur l'hôte. */
+const MAX_TYPED_CHARS = 20000;
+
+/**
+ * Tape un texte sur l'hôte, par paquets espacés.
+ *
+ * L'application qui a le focus traite les frappes à son rythme ; lui en livrer
+ * vingt mille d'un bloc en ferait perdre une partie à certaines.
+ */
+function typeText(text) {
+  if (text.length > MAX_TYPED_CHARS) {
+    toast(`Texte coupé à ${MAX_TYPED_CHARS} caractères`);
+  }
+  const frames = chunk(textToEvents(text.slice(0, MAX_TYPED_CHARS)), 32);
+  const run = state.run;
+  const next = () => {
+    if (run !== state.run || !frames.length) return;
+    sendReliable(frames.shift());
+    setTimeout(next, 8);
+  };
+  next();
+}
+
+// --- Émission des entrées ---------------------------------------------------
+
+const canSend = () => state.live && state.caps?.input_injection !== false;
+
+/** Met en file un événement que le suivant rattrape, pour le canal non fiable. */
+function queueLossy(bytes) {
+  if (!canSend() || state.input?.readyState !== 'open') return;
   state.pending.push(bytes);
   if (state.flushScheduled) return;
   state.flushScheduled = true;
   // Regrouper sur une trame d'affichage : un geste continu produit une seule
-  // trame de plusieurs événements au lieu de dizaines de datagrammes.
-  requestAnimationFrame(flush);
+  // trame au lieu de dizaines de datagrammes.
+  requestAnimationFrame(flushLossy);
 }
 
-function flush() {
+function flushLossy() {
   state.flushScheduled = false;
-  const events = state.pending.splice(0, 64);
-  if (!events.length) return;
-
-  const size = 6 + events.reduce((n, e) => n + e.length, 0);
-  const frame = new Uint8Array(size);
-  const view = new DataView(frame.buffer);
-  frame[0] = 1;
-  view.setUint32(1, state.seq, true);
-  frame[5] = events.length;
-  let offset = 6;
-  for (const event of events) {
-    frame.set(event, offset);
-    offset += event.length;
+  if (!state.pending.length || state.input?.readyState !== 'open') {
+    state.pending = [];
+    return;
   }
-  state.seq = (state.seq + 1) >>> 0;
-
-  try {
-    state.input.send(frame);
-  } catch {
-    // Canal saturé : la trame suivante portera la position à jour.
+  const events = coalesce(state.pending.splice(0));
+  for (const part of chunk(events, MAX_EVENTS_PER_FRAME)) {
+    try {
+      state.input.send(encodeFrame(state.seqLossy, part));
+    } catch {
+      // Canal saturé : la trame suivante portera la position à jour.
+    }
+    state.seqLossy = (state.seqLossy + 1) >>> 0;
   }
-  if (state.pending.length) queue([]);
 }
-
-const moveRelative = (dx, dy) => {
-  const bytes = new Uint8Array(5);
-  const view = new DataView(bytes.buffer);
-  bytes[0] = EVENT.MOVE_REL;
-  view.setInt16(1, clamp(dx, -32768, 32767), true);
-  view.setInt16(3, clamp(dy, -32768, 32767), true);
-  queue(bytes);
-};
-
-const moveAbsolute = (x, y) => {
-  const bytes = new Uint8Array(5);
-  const view = new DataView(bytes.buffer);
-  bytes[0] = EVENT.MOVE_ABS;
-  view.setUint16(1, clamp(Math.round(x * 65535), 0, 65535), true);
-  view.setUint16(3, clamp(Math.round(y * 65535), 0, 65535), true);
-  queue(bytes);
-};
-
-const button = (index, pressed) =>
-  queue(new Uint8Array([EVENT.BUTTON, index, pressed ? 1 : 0]));
-
-const scroll = (dx, dy) => {
-  const bytes = new Uint8Array(5);
-  const view = new DataView(bytes.buffer);
-  bytes[0] = EVENT.SCROLL;
-  view.setInt16(1, clamp(dx, -32768, 32767), true);
-  view.setInt16(3, clamp(dy, -32768, 32767), true);
-  queue(bytes);
-};
-
-const key = (code, pressed) => {
-  const mapped = toScancode(code);
-  if (!mapped) return false;
-  const bytes = new Uint8Array(4);
-  const view = new DataView(bytes.buffer);
-  bytes[0] = EVENT.KEY;
-  view.setUint16(1, mapped.scancode, true);
-  bytes[3] = (pressed ? 1 : 0) | (mapped.extended ? 2 : 0);
-  queue(bytes);
-  return true;
-};
-
-const clamp = (value, min, max) => Math.min(max, Math.max(min, Math.round(value)));
-
-// --- Curseur local ----------------------------------------------------------
 
 /**
- * Le bureau capturé ne contient jamais le curseur : Desktop Duplication le
- * livre séparément. Le dessiner localement le rend immédiat, sans attendre
- * l'aller-retour réseau.
+ * Envoie tout de suite des événements qui ne doivent pas se perdre.
+ *
+ * Les mouvements en attente partent d'abord : un clic doit suivre le dernier
+ * déplacement, pas le précéder.
  */
-function drawCursor() {
-  const rect = videoContentRect();
-  ui.cursor.style.left = `${rect.x + state.cursor.x * rect.width}px`;
-  ui.cursor.style.top = `${rect.y + state.cursor.y * rect.height}px`;
+function sendReliable(events) {
+  if (!canSend() || state.control?.readyState !== 'open') return;
+  flushLossy();
+  for (const part of chunk(events, MAX_EVENTS_PER_FRAME)) {
+    state.control.send(encodeFrame(state.seqReliable, part));
+    state.seqReliable = (state.seqReliable + 1) >>> 0;
+  }
+}
+
+/** Traduit une touche décrite par position ou par caractère. */
+const keyEvent = (key, pressed) => {
+  if (key.char) return input.keyChar(key.char, pressed);
+  const mapped = toScancode(key.code);
+  return mapped ? input.key(mapped.scancode, pressed, mapped.extended) : null;
+};
+
+async function pressCombo(keys) {
+  sendReliable(keys.map((key) => keyEvent(key, true)).filter(Boolean));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  sendReliable([...keys].reverse().map((key) => keyEvent(key, false)).filter(Boolean));
+  releaseSticky();
+}
+
+/** Relâche tout ce que ce client tient enfoncé sur l'hôte. */
+function releaseEverything() {
+  const events = [];
+  for (const code of state.held) {
+    const mapped = toScancode(code);
+    if (mapped) events.push(input.key(mapped.scancode, false, mapped.extended));
+  }
+  state.held.clear();
+  for (const code of state.sticky) {
+    const mapped = toScancode(code);
+    if (mapped) events.push(input.key(mapped.scancode, false, mapped.extended));
+  }
+  state.sticky.clear();
+  renderSticky();
+  if (gesture?.dragging) events.push(input.button(0, false));
+  for (const index of mouseButtons) events.push(input.button(index, false));
+  mouseButtons.clear();
+  if (events.length) sendReliable(events);
+}
+
+// --- Curseur ----------------------------------------------------------------
+
+/**
+ * Le bureau capturé ne contient jamais le curseur : le compositeur le livre à
+ * part. L'agent en transmet la forme et la position réelle, et c'est ici
+ * qu'il est dessiné.
+ */
+function resetShape() {
+  // Flèche par défaut, affichée tant que l'hôte n'a pas donné la sienne.
+  const canvas = ui.cursor;
+  canvas.width = 12;
+  canvas.height = 18;
+  const context = canvas.getContext('2d');
+  context.clearRect(0, 0, 12, 18);
+  const arrow = new Path2D('M1 1l10 9.5H6.2l2.6 5.6-2.1 1-2.6-5.7L1 14.6z');
+  context.fillStyle = '#fff';
+  context.strokeStyle = '#000';
+  context.lineWidth = 1.1;
+  context.lineJoin = 'round';
+  context.fill(arrow);
+  context.stroke(arrow);
+  state.shape = { width: 12, height: 18, hotX: 1, hotY: 1, blank: false, custom: false };
+  state.cursorUrl = null;
+}
+
+function onPointerShape({ width, height, hot_x: hotX, hot_y: hotY, rgba }) {
+  const pixels = fromBase64(rgba);
+  if (width < 1 || height < 1 || width > 256 || height > 256
+      || pixels.length !== width * height * 4) {
+    return;
+  }
+  const canvas = ui.cursor;
+  canvas.width = width;
+  canvas.height = height;
+  canvas.getContext('2d').putImageData(
+    new ImageData(new Uint8ClampedArray(pixels.buffer), width, height), 0, 0,
+  );
+  let blank = true;
+  for (let i = 3; i < pixels.length; i += 4) {
+    if (pixels[i] !== 0) {
+      blank = false;
+      break;
+    }
+  }
+  state.shape = { width, height, hotX, hotY, blank, custom: true };
+  state.cursorUrl = null;
+  renderCursor();
+}
+
+function onPointerUpdate(buffer) {
+  const update = decodePointer(buffer);
+  if (!update || !state.pointerSeq.accept(update.seq)) return;
+  state.pointer = { x: update.x, y: update.y, visible: update.visible, known: true };
+  renderCursor();
 }
 
 /** Rectangle réellement occupé par l'image dans l'élément vidéo. */
 function videoContentRect() {
   const box = ui.video.getBoundingClientRect();
-  const videoRatio = (ui.video.videoWidth || state.desktop.width)
+  const ratio = (ui.video.videoWidth || state.desktop.width)
     / (ui.video.videoHeight || state.desktop.height);
-  const boxRatio = box.width / box.height;
-  if (videoRatio > boxRatio) {
-    const height = box.width / videoRatio;
-    return { x: box.x, y: box.y + (box.height - height) / 2, width: box.width, height };
-  }
-  const width = box.height * videoRatio;
-  return { x: box.x + (box.width - width) / 2, y: box.y, width, height: box.height };
+  return contentRect(box, ratio, portrait.matches ? 0 : 0.5);
 }
 
-function moveCursorBy(dx, dy) {
+// Téléphone tenu debout : l'image est calée en haut de l'écran, pour que le
+// panneau de commandes s'ouvre sous elle plutôt que par-dessus. La feuille de
+// style applique la même règle à `object-position`.
+const portrait = matchMedia('(orientation: portrait)');
+portrait.addEventListener('change', () => renderCursor());
+
+/**
+ * Le curseur du système local tient-il lieu de curseur distant ?
+ *
+ * Avec une souris en pointage direct, oui : il est déjà à l'endroit visé, sans
+ * le moindre délai. Il lui suffit de prendre la forme de celui de l'hôte.
+ */
+const usesNativeCursor = () => state.absolute && lastPointerType !== 'touch';
+
+function renderCursor() {
+  if (!state.live) return;
   const rect = videoContentRect();
-  state.cursor.x = Math.min(1, Math.max(0, state.cursor.x + dx / rect.width));
-  state.cursor.y = Math.min(1, Math.max(0, state.cursor.y + dy / rect.height));
-  drawCursor();
-}
+  const scale = rect.width / state.desktop.width;
+  const shape = state.shape;
 
-// --- Gestes -----------------------------------------------------------------
-
-let pointerDown = false;
-let lastPointer = null;
-let touchStart = null;
-let pinchDistance = null;
-
-ui.video.addEventListener('pointerdown', (event) => {
-  if (!state.live) return;
-  ui.video.setPointerCapture(event.pointerId);
-  pointerDown = true;
-  lastPointer = { x: event.clientX, y: event.clientY };
-  touchStart = { time: performance.now(), x: event.clientX, y: event.clientY };
-
-  if (event.pointerType === 'mouse') {
-    if (state.absolute) sendAbsoluteFrom(event);
-    button(mouseButton(event.button), true);
-  }
-});
-
-ui.video.addEventListener('pointermove', (event) => {
-  if (!state.live) return;
-
-  if (event.pointerType === 'mouse') {
-    if (state.absolute) {
-      sendAbsoluteFrom(event);
-    } else if (document.pointerLockElement === ui.video) {
-      moveRelative(event.movementX, event.movementY);
-      moveCursorBy(event.movementX, event.movementY);
-    } else if (pointerDown) {
-      const dx = event.clientX - lastPointer.x;
-      const dy = event.clientY - lastPointer.y;
-      moveRelative(dx, dy);
-      moveCursorBy(dx, dy);
-    }
-    lastPointer = { x: event.clientX, y: event.clientY };
+  if (usesNativeCursor()) {
+    ui.cursor.classList.remove('on');
+    ui.video.style.cursor = shape.blank ? 'none' : nativeCursor(scale);
     return;
   }
 
-  if (!pointerDown) return;
-  const dx = event.clientX - lastPointer.x;
-  const dy = event.clientY - lastPointer.y;
-  lastPointer = { x: event.clientX, y: event.clientY };
+  ui.video.style.cursor = 'none';
+  const visible = state.pointer.known && state.pointer.visible && !shape.blank;
+  ui.cursor.classList.toggle('on', visible);
+  if (!visible) return;
+  const stage = ui.stage.getBoundingClientRect();
+  const left = rect.x - stage.x + state.pointer.x * scale;
+  const top = rect.y - stage.y + state.pointer.y * scale;
+  ui.cursor.style.transform = `translate(${left}px, ${top}px) scale(${scale})`;
+}
 
-  if (state.absolute) {
-    sendAbsoluteFrom(event);
-  } else {
-    // Gain progressif : les petits gestes gagnent en précision, les grands en
-    // portée, comme sur un trackpad matériel.
-    const speed = Math.hypot(dx, dy);
-    const gain = 1 + Math.min(1.6, speed / 14);
-    moveRelative(dx * gain, dy * gain);
-    moveCursorBy(dx * gain, dy * gain);
-  }
-});
+/** Valeur CSS `cursor` reproduisant le curseur de l'hôte à l'échelle de l'image. */
+function nativeCursor(scale) {
+  const shape = state.shape;
+  if (!shape.custom) return 'default';
+  const key = scale.toFixed(3);
+  if (state.cursorUrl?.key === key) return state.cursorUrl.value;
 
-ui.video.addEventListener('pointerup', (event) => {
-  if (!state.live) return;
-  pointerDown = false;
+  // Les navigateurs ignorent une image de curseur de plus de 128 pixels.
+  const factor = Math.min(scale, 128 / Math.max(shape.width, shape.height));
+  const width = Math.max(1, Math.round(shape.width * factor));
+  const height = Math.max(1, Math.round(shape.height * factor));
+  const scaled = document.createElement('canvas');
+  scaled.width = width;
+  scaled.height = height;
+  scaled.getContext('2d').drawImage(ui.cursor, 0, 0, width, height);
+  const hotX = Math.min(width - 1, Math.round(shape.hotX * factor));
+  const hotY = Math.min(height - 1, Math.round(shape.hotY * factor));
+  const value = `url(${scaled.toDataURL('image/png')}) ${hotX} ${hotY}, default`;
+  state.cursorUrl = { key, value };
+  return value;
+}
 
-  if (event.pointerType === 'mouse') {
-    button(mouseButton(event.button), false);
-    return;
-  }
-  // Toucher bref et immobile : clic gauche à la position courante.
-  const moved = Math.hypot(event.clientX - touchStart.x, event.clientY - touchStart.y);
-  if (performance.now() - touchStart.time < 250 && moved < 12) {
-    button(0, true);
-    button(0, false);
-  }
-});
+// --- Pointeur ---------------------------------------------------------------
 
-ui.video.addEventListener('wheel', (event) => {
-  if (!state.live) return;
-  event.preventDefault();
-  // Un cran de molette vaut 120 unités côté Windows.
-  scroll(-Math.sign(event.deltaX) * 120, -Math.sign(event.deltaY) * 120);
-}, { passive: false });
+let lastPointerType = matchMedia('(pointer: fine)').matches ? 'mouse' : 'touch';
+const mouseButtons = new Set();
+const wheelCarry = { x: 0, y: 0 };
 
-ui.video.addEventListener('touchmove', (event) => {
-  if (!state.live || event.touches.length !== 2) return;
-  event.preventDefault();
-  const [a, b] = event.touches;
-  const distance = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
-  const midY = (a.clientY + b.clientY) / 2;
-  if (pinchDistance !== null && Math.abs(distance - pinchDistance) < 8) {
-    scroll(0, Math.sign(touchStart.y - midY) * -120);
-  }
-  pinchDistance = distance;
-  touchStart = { ...touchStart, y: midY };
-}, { passive: false });
-
-ui.video.addEventListener('touchend', () => { pinchDistance = null; });
-ui.video.addEventListener('contextmenu', (event) => event.preventDefault());
-
-ui.video.addEventListener('dblclick', () => {
-  if (state.live && !state.absolute && document.pointerLockElement !== ui.video) {
-    ui.video.requestPointerLock?.();
-  }
-});
-
-function sendAbsoluteFrom(event) {
+/** Position normalisée d'un événement dans l'image du bureau, ou `null` hors image. */
+function normalized(pointerEvent) {
   const rect = videoContentRect();
-  const x = (event.clientX - rect.x) / rect.width;
-  const y = (event.clientY - rect.y) / rect.height;
-  if (x < 0 || x > 1 || y < 0 || y > 1) return;
-  state.cursor = { x, y };
-  drawCursor();
-  moveAbsolute(x, y);
+  const x = (pointerEvent.clientX - rect.x) / rect.width;
+  const y = (pointerEvent.clientY - rect.y) / rect.height;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+  return { x, y };
 }
 
 const mouseButton = (index) => ({ 0: 0, 2: 1, 1: 2, 3: 3, 4: 4 })[index] ?? 0;
+const pointerLocked = () => document.pointerLockElement === ui.video;
 
-// --- Clavier ----------------------------------------------------------------
+function notePointerType(type) {
+  if (type === lastPointerType) return;
+  lastPointerType = type;
+  renderCursor();
+}
 
-window.addEventListener('keydown', (event) => {
+// Souris et stylet.
+
+function onMouseDown(pointerEvent) {
+  ui.video.setPointerCapture(pointerEvent.pointerId);
+  const index = mouseButton(pointerEvent.button);
+
+  if (state.absolute) {
+    const at = normalized(pointerEvent);
+    if (!at) return;
+    mouseButtons.add(index);
+    sendReliable([input.moveAbsolute(at.x, at.y), input.button(index, true)]);
+    return;
+  }
+  // Mode trackpad à la souris : il faut capturer le pointeur pour recevoir des
+  // déplacements sans borne. Le premier clic sert à cela, et à rien d'autre.
+  if (!pointerLocked()) {
+    ui.video.requestPointerLock?.();
+    return;
+  }
+  mouseButtons.add(index);
+  sendReliable([input.button(index, true)]);
+}
+
+function onMouseMove(pointerEvent) {
+  if (state.absolute) {
+    const at = normalized(pointerEvent);
+    if (at) queueLossy(input.moveAbsolute(at.x, at.y));
+  } else if (pointerLocked()) {
+    queueLossy(input.moveRelative(pointerEvent.movementX, pointerEvent.movementY));
+  }
+}
+
+function onMouseUp(pointerEvent) {
+  const index = mouseButton(pointerEvent.button);
+  if (!mouseButtons.delete(index)) return;
+  const events = [input.button(index, false)];
+  const at = state.absolute ? normalized(pointerEvent) : null;
+  if (at) events.unshift(input.moveAbsolute(at.x, at.y));
+  sendReliable(events);
+}
+
+// Tactile.
+//
+// Un doigt déplace le pointeur, un toucher bref clique. Deux doigts défilent,
+// ou font un clic droit s'ils ne bougent pas. Un appui long fait aussi un clic
+// droit. Un double toucher dont le second se prolonge fait glisser, comme sur
+// le pavé tactile d'un ordinateur portable.
+
+const TAP_MS = 280;
+const TAP_SLOP = 10;
+const LONG_PRESS_MS = 550;
+const DOUBLE_TAP_MS = 320;
+
+const touches = new Map();
+let gesture = null;
+let lastTapAt = 0;
+
+function centroid() {
+  let x = 0;
+  let y = 0;
+  for (const touch of touches.values()) {
+    x += touch.x;
+    y += touch.y;
+  }
+  return { x: x / touches.size, y: y / touches.size };
+}
+
+function onTouchDown(pointerEvent) {
+  touches.set(pointerEvent.pointerId, { x: pointerEvent.clientX, y: pointerEvent.clientY });
+  const now = performance.now();
+
+  if (touches.size === 1) {
+    gesture = {
+      start: now, fingers: 1, moved: false, consumed: false,
+      dragging: now - lastTapAt < DOUBLE_TAP_MS,
+      last: { x: pointerEvent.clientX, y: pointerEvent.clientY },
+      travel: 0, carry: { x: 0, y: 0 }, timer: null,
+    };
+    const at = state.absolute ? normalized(pointerEvent) : null;
+    const events = at ? [input.moveAbsolute(at.x, at.y)] : [];
+    if (gesture.dragging) events.push(input.button(0, true));
+    if (events.length) sendReliable(events);
+
+    if (!gesture.dragging) {
+      const current = gesture;
+      current.timer = setTimeout(() => {
+        if (gesture !== current || current.moved || current.fingers !== 1) return;
+        current.consumed = true;
+        navigator.vibrate?.(15);
+        sendReliable([input.button(1, true), input.button(1, false)]);
+      }, LONG_PRESS_MS);
+    }
+    return;
+  }
+
+  if (!gesture) return;
+  clearTimeout(gesture.timer);
+  gesture.fingers = Math.max(gesture.fingers, touches.size);
+  if (gesture.dragging) {
+    gesture.dragging = false;
+    sendReliable([input.button(0, false)]);
+  }
+  gesture.last = centroid();
+}
+
+function onTouchMove(pointerEvent) {
+  const touch = touches.get(pointerEvent.pointerId);
+  if (!touch || !gesture) return;
+  touch.x = pointerEvent.clientX;
+  touch.y = pointerEvent.clientY;
+
+  const at = centroid();
+  const dx = at.x - gesture.last.x;
+  const dy = at.y - gesture.last.y;
+  gesture.last = at;
+  gesture.travel += Math.hypot(dx, dy);
+  if (!gesture.moved && gesture.travel > TAP_SLOP) {
+    gesture.moved = true;
+    clearTimeout(gesture.timer);
+  }
+  if (!gesture.moved) return;
+
+  if (touches.size >= 2) {
+    // Défilement « naturel » : le contenu suit les doigts.
+    const x = gesture.carry.x - dx * 3;
+    const y = gesture.carry.y + dy * 3;
+    const units = { x: Math.trunc(x), y: Math.trunc(y) };
+    gesture.carry = { x: x - units.x, y: y - units.y };
+    if (units.x || units.y) queueLossy(input.scroll(units.x, units.y));
+    return;
+  }
+  if (gesture.fingers > 1) return;
+
+  if (state.absolute) {
+    const target = normalized(pointerEvent);
+    if (target) queueLossy(input.moveAbsolute(target.x, target.y));
+  } else {
+    // Gain progressif : les petits gestes gagnent en précision, les grands en
+    // portée, comme sur un pavé tactile matériel.
+    const gain = 1 + Math.min(1.6, Math.hypot(dx, dy) / 14);
+    queueLossy(input.moveRelative(dx * gain, dy * gain));
+  }
+}
+
+function onTouchUp(pointerEvent) {
+  if (!touches.delete(pointerEvent.pointerId) || !gesture) return;
+  if (touches.size > 0) {
+    gesture.last = centroid();
+    return;
+  }
+
+  const finished = gesture;
+  gesture = null;
+  clearTimeout(finished.timer);
+  const brief = performance.now() - finished.start < TAP_MS;
+
+  if (finished.dragging) {
+    sendReliable([input.button(0, false)]);
+  } else if (!finished.consumed && !finished.moved && brief) {
+    const index = finished.fingers >= 2 ? 1 : 0;
+    sendReliable([input.button(index, true), input.button(index, false)]);
+    if (index === 0) lastTapAt = performance.now();
+  }
+}
+
+ui.video.addEventListener('pointerdown', (pointerEvent) => {
   if (!state.live) return;
-  if (key(event.code, true)) event.preventDefault();
+  notePointerType(pointerEvent.pointerType);
+  if (pointerEvent.pointerType === 'touch') onTouchDown(pointerEvent);
+  else onMouseDown(pointerEvent);
 });
 
-window.addEventListener('keyup', (event) => {
+ui.video.addEventListener('pointermove', (pointerEvent) => {
   if (!state.live) return;
-  if (key(event.code, false)) event.preventDefault();
+  notePointerType(pointerEvent.pointerType);
+  if (pointerEvent.pointerType === 'touch') onTouchMove(pointerEvent);
+  else onMouseMove(pointerEvent);
 });
 
-// Un onglet qui perd le focus ne reçoit plus les relâchements : sans ce filet,
-// une modificatrice resterait enfoncée sur l'hôte.
-window.addEventListener('blur', () => {
+for (const type of ['pointerup', 'pointercancel']) {
+  ui.video.addEventListener(type, (pointerEvent) => {
+    if (!state.live) return;
+    if (pointerEvent.pointerType === 'touch') onTouchUp(pointerEvent);
+    else onMouseUp(pointerEvent);
+  });
+}
+
+ui.video.addEventListener('wheel', (wheelEvent) => {
   if (!state.live) return;
-  for (const code of ['ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight',
-    'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight']) {
-    key(code, false);
+  wheelEvent.preventDefault();
+  const vertical = wheelUnits(wheelEvent.deltaY, wheelEvent.deltaMode, wheelCarry.y);
+  // Horizontalement, navigateur et Windows comptent dans le même sens.
+  const horizontal = wheelUnits(-wheelEvent.deltaX, wheelEvent.deltaMode, wheelCarry.x);
+  wheelCarry.x = horizontal.carry;
+  wheelCarry.y = vertical.carry;
+  if (horizontal.units || vertical.units) {
+    queueLossy(input.scroll(horizontal.units, vertical.units));
+  }
+}, { passive: false });
+
+// Empêche le navigateur de retirer le focus au champ de saisie — donc de
+// replier le clavier virtuel — à chaque toucher sur l'image.
+ui.video.addEventListener('touchstart', (touchEvent) => touchEvent.preventDefault(),
+  { passive: false });
+ui.video.addEventListener('contextmenu', (mouseEvent) => mouseEvent.preventDefault());
+document.addEventListener('pointerlockchange', () => {
+  if (!pointerLocked()) {
+    for (const index of mouseButtons) sendReliable([input.button(index, false)]);
+    mouseButtons.clear();
   }
 });
 
-async function pressCombo(codes) {
-  for (const code of codes) key(code, true);
-  await new Promise((resolve) => setTimeout(resolve, 40));
-  for (const code of [...codes].reverse()) key(code, false);
+// --- Clavier ----------------------------------------------------------------
+
+/** L'utilisateur tape-t-il pour la page elle-même, et non pour l'hôte ? */
+const typingLocally = (target) =>
+  target === ui.code || target === ui.clipArea || ui.confirm.open || ui.clip.open;
+
+window.addEventListener('keydown', (keyboardEvent) => {
+  if (!state.live || typingLocally(keyboardEvent.target)) return;
+  // Composition en cours : c'est du texte, il passera par le champ de saisie.
+  if (keyboardEvent.isComposing || keyboardEvent.keyCode === 229) return;
+  const mapped = scancodeOf(keyboardEvent);
+  if (!mapped) return;
+  keyboardEvent.preventDefault();
+  if (keyboardEvent.code) state.held.add(keyboardEvent.code);
+  sendReliable([input.key(mapped.scancode, true, mapped.extended)]);
+  // Clavier virtuel : pas de relâchement à attendre, on le fait nous-mêmes.
+  if (!keyboardEvent.code) {
+    sendReliable([input.key(mapped.scancode, false, mapped.extended)]);
+    releaseSticky();
+  }
+});
+
+window.addEventListener('keyup', (keyboardEvent) => {
+  if (!state.live || typingLocally(keyboardEvent.target)) return;
+  const mapped = toScancode(keyboardEvent.code);
+  if (!mapped) return;
+  keyboardEvent.preventDefault();
+  state.held.delete(keyboardEvent.code);
+  sendReliable([input.key(mapped.scancode, false, mapped.extended)]);
+  if (!MODIFIER_CODES.has(keyboardEvent.code)) releaseSticky();
+});
+
+const MODIFIER_CODES = new Set(['ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight',
+  'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight']);
+
+// Un onglet qui perd le focus ne reçoit plus les relâchements : sans ce filet,
+// une touche resterait enfoncée sur l'hôte.
+window.addEventListener('blur', () => {
+  if (state.live) releaseEverything();
+});
+
+// Saisie de texte : claviers virtuels et méthodes de saisie.
+//
+// Ces claviers ne produisent pas de touches mais du texte, souvent par
+// composition : le mot en cours est réécrit à chaque frappe. Le champ caché
+// sert de brouillon ; à chaque changement, la différence avec ce qui a déjà
+// été envoyé part vers l'hôte — des retours arrière pour ce qui a disparu, des
+// caractères pour ce qui est apparu.
+
+/** Caractère gardé en tête du champ : sans lui, un retour arrière sur un champ
+ *  vide ne déclencherait aucun événement. */
+const SENTINEL = '​';
+let typed = '';
+let composing = false;
+
+function resetIme() {
+  typed = '';
+  ui.ime.value = SENTINEL;
+}
+
+function onImeInput() {
+  const value = ui.ime.value;
+  if (!value.startsWith(SENTINEL)) {
+    // La sentinelle a été effacée : retour arrière au-delà de ce brouillon.
+    sendReliable([...backspaces(1)]);
+    resetIme();
+    return;
+  }
+  const current = value.slice(SENTINEL.length);
+  const { backspaces: removed, added } = textDelta(typed, current);
+  typed = current;
+
+  const events = [...backspaces(removed)];
+  if (added) {
+    const modified = [...state.sticky].some((code) => code !== 'ShiftLeft');
+    if (modified && added.length === 1) {
+      // Modificatrice à bascule active : c'est un raccourci, pas du texte.
+      const char = added.toLowerCase();
+      events.push(input.keyChar(char, true), input.keyChar(char, false));
+    } else {
+      events.push(...textToEvents(added));
+    }
+  }
+  if (events.length) sendReliable(events);
+  if (added) releaseSticky();
+  if (!composing && current.length > 48) resetIme();
+}
+
+function backspaces(count) {
+  const mapped = toScancode('Backspace');
+  const events = [];
+  for (let i = 0; i < count; i += 1) {
+    events.push(input.key(mapped.scancode, true, false), input.key(mapped.scancode, false, false));
+  }
+  return events;
+}
+
+ui.ime.addEventListener('input', onImeInput);
+ui.ime.addEventListener('compositionstart', () => { composing = true; });
+ui.ime.addEventListener('compositionend', () => {
+  composing = false;
+  onImeInput();
+  resetIme();
+});
+ui.ime.addEventListener('focus', resetIme);
+ui.ime.addEventListener('blur', () => ui.keyboard.classList.remove('on'));
+
+// Modificatrices à bascule.
+
+function toggleSticky(code) {
+  const mapped = toScancode(code);
+  if (state.sticky.has(code)) {
+    state.sticky.delete(code);
+    sendReliable([input.key(mapped.scancode, false, mapped.extended)]);
+  } else {
+    state.sticky.add(code);
+    sendReliable([input.key(mapped.scancode, true, mapped.extended)]);
+  }
+  renderSticky();
+}
+
+function releaseSticky() {
+  if (!state.sticky.size) return;
+  const events = [...state.sticky].map((code) => {
+    const mapped = toScancode(code);
+    return input.key(mapped.scancode, false, mapped.extended);
+  });
+  state.sticky.clear();
+  sendReliable(events);
+  renderSticky();
+}
+
+function renderSticky() {
+  for (const element of ui.shortcuts.querySelectorAll('[data-sticky]')) {
+    element.classList.toggle('on', state.sticky.has(element.dataset.sticky));
+  }
 }
 
 // --- Interface --------------------------------------------------------------
 
+function setHud(open) {
+  ui.hud.classList.toggle('open', open);
+  ui.grip.setAttribute('aria-expanded', String(open));
+}
+
+function renderMode() {
+  ui.mode.textContent = state.absolute ? 'Pointage direct' : 'Trackpad';
+  ui.mode.title = state.absolute
+    ? 'Le pointeur va là où vous pointez. Appuyez pour passer en trackpad.'
+    : 'Vos gestes déplacent le pointeur. Appuyez pour passer en pointage direct.';
+  for (const element of document.querySelectorAll('[data-quality]')) {
+    element.classList.toggle('on', element.dataset.quality === state.quality);
+  }
+}
+
+for (const modifier of MODIFIERS) {
+  const element = document.createElement('button');
+  element.textContent = modifier.label;
+  element.dataset.sticky = modifier.code;
+  element.onclick = () => toggleSticky(modifier.code);
+  ui.shortcuts.append(element);
+}
+{
+  const separator = document.createElement('span');
+  separator.className = 'sep';
+  ui.shortcuts.append(separator);
+}
 for (const shortcut of SHORTCUTS) {
   const element = document.createElement('button');
   element.textContent = shortcut.label;
@@ -902,48 +1525,124 @@ for (const shortcut of SHORTCUTS) {
   ui.shortcuts.append(element);
 }
 
-ui.grip.parentElement.addEventListener('click', (event) => {
-  if (event.target === ui.grip || event.target === ui.hud) {
-    ui.hud.classList.toggle('open');
-  }
-});
+// Les boutons du panneau ne prennent pas le focus : il doit rester au champ de
+// saisie, faute de quoi chaque raccourci replierait le clavier virtuel.
+for (const type of ['pointerdown', 'mousedown']) {
+  ui.hud.addEventListener(type, (pointerEvent) => {
+    if (pointerEvent.target.closest('button')) pointerEvent.preventDefault();
+  });
+}
+
+ui.grip.onclick = () => {
+  state.hudTouched = true;
+  setHud(!ui.hud.classList.contains('open'));
+};
 
 for (const element of document.querySelectorAll('[data-quality]')) {
   element.onclick = () => {
-    command('set_quality', { preset: element.dataset.quality });
-    document.querySelectorAll('[data-quality]').forEach((b) => b.classList.remove('on'));
-    element.classList.add('on');
+    state.quality = element.dataset.quality;
+    command('set_quality', { preset: state.quality });
+    renderMode();
   };
 }
 
 ui.mode.onclick = () => {
   state.absolute = !state.absolute;
-  ui.mode.textContent = state.absolute ? 'Direct' : 'Trackpad';
-  ui.mode.classList.toggle('on', state.absolute);
-  command('set_cursor_mode', { mode: state.absolute ? 'absolute' : 'relative' });
-  if (document.pointerLockElement === ui.video) document.exitPointerLock();
+  if (pointerLocked()) document.exitPointerLock();
+  renderMode();
+  renderCursor();
+  if (!state.absolute && lastPointerType !== 'touch') {
+    toast('Cliquez sur l’image pour capturer la souris, Échap pour la libérer');
+  }
 };
 
 ui.keyboard.onclick = () => {
-  ui.ime.focus();
-  ui.ime.click();
+  if (document.activeElement === ui.ime) {
+    ui.ime.blur();
+    return;
+  }
+  ui.ime.focus({ preventScroll: true });
+  ui.keyboard.classList.add('on');
 };
 
-ui.fullscreen.onclick = () => {
-  if (document.fullscreenElement) document.exitFullscreen();
-  else document.documentElement.requestFullscreen?.().catch(() => {});
+ui.paste.onclick = pasteToHost;
+ui.copy.onclick = () => command('request_clipboard');
+
+ui.stats.onclick = () => {
+  state.showDetails = !state.showDetails;
+  ui.stats.classList.toggle('on', state.showDetails);
+  renderDetails(state.agentStats
+    ? estimateLatency(state.agentStats.encode_ms, state.rtc, state.agentStats.rtt_ms) : null);
 };
 
-ui.lock.onclick = () => command('lock');
-ui.unlock.onclick = connect;
-ui.pair.onclick = submitPairing;
-ui.code.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') submitPairing();
+ui.fullscreen.onclick = async () => {
+  if (document.fullscreenElement) {
+    await document.exitFullscreen().catch(() => {});
+    return;
+  }
+  await document.documentElement.requestFullscreen?.().catch(() => {});
+  // En plein écran, le navigateur peut nous céder les touches qu'il garde
+  // d'ordinaire pour lui : Échap, Alt+Tab, la touche Windows.
+  navigator.keyboard?.lock?.().catch(() => {});
+};
+document.addEventListener('fullscreenchange', () => {
+  ui.fullscreen.classList.toggle('on', Boolean(document.fullscreenElement));
+  if (!document.fullscreenElement) navigator.keyboard?.unlock?.();
+  renderCursor();
 });
 
-window.addEventListener('resize', () => { if (state.live) drawCursor(); });
+ui.lock.onclick = () => command('lock');
 
-const groupHex = (hex) => (hex.slice(0, 16).match(/.{4}/g) ?? []).join('-').toUpperCase();
+const POWER = {
+  sleep: ['Mettre l’hôte en veille ?', 'La session se fermera. Un réveil réseau sera nécessaire pour y revenir.', 'Mettre en veille'],
+  reboot: ['Redémarrer l’hôte ?', 'Les applications ouvertes seront fermées.', 'Redémarrer'],
+  shutdown: ['Éteindre l’hôte ?', 'Il faudra le rallumer, sur place ou par réveil réseau.', 'Éteindre'],
+};
+for (const [name, [title, text, action]] of Object.entries(POWER)) {
+  $(name).onclick = async () => {
+    if (await confirmAction(title, text, action)) command(name);
+  };
+}
+
+ui.disconnect.onclick = disconnect;
+ui.unlock.onclick = () => {
+  state.attempt = 0;
+  state.wasLive = false;
+  connect();
+};
+ui.cancel.onclick = cancel;
+ui.pair.onclick = submitPairing;
+ui.code.addEventListener('keydown', (keyboardEvent) => {
+  if (keyboardEvent.key === 'Enter') submitPairing();
+});
+ui.clipClose.onclick = () => ui.clip.close();
+
+ui.forget.onclick = async () => {
+  const confirmed = await confirmAction(
+    'Oublier l’hôte précédent ?',
+    'Cet appareil devra être appairé de nouveau, avec un code lu sur l’hôte.',
+    'Oublier',
+  );
+  if (!confirmed) return;
+  await dbDelete('agent');
+  ui.trust.hidden = true;
+  ui.hostFingerprint.textContent = '—';
+  setStatus('Hôte oublié. Reconnectez-vous pour appairer.');
+  refreshOptions();
+};
+
+ui.biometrics.onclick = async () => {
+  if (await dbGet('webauthn')) {
+    await dbDelete('webauthn');
+    toast('La biométrie n’est plus demandée');
+    refreshOptions();
+  } else {
+    await enrollBiometrics();
+  }
+};
+
+window.addEventListener('resize', renderCursor);
+ui.video.addEventListener('resize', renderCursor);
 
 function deviceLabel() {
   const ua = navigator.userAgent;
@@ -951,6 +1650,7 @@ function deviceLabel() {
   if (/Android/.test(ua)) return 'Android';
   if (/Mac/.test(ua)) return 'Mac';
   if (/Windows/.test(ua)) return 'Windows';
+  if (/Linux/.test(ua)) return 'Linux';
   return 'Navigateur';
 }
 
@@ -958,16 +1658,20 @@ function deviceLabel() {
 
 (async function boot() {
   if (!window.isSecureContext) {
-    setStatus('Contexte non sécurisé : WebRTC et WebCrypto sont indisponibles.', true);
+    setStatus('Contexte non sécurisé : WebRTC et WebCrypto sont indisponibles.', { error: true });
     return;
   }
   try {
     state.identity = await loadIdentity();
-    ui.fingerprint.textContent = `cet appareil ${groupHex(state.identity.publicKeyHex.slice(2))}`;
+    // Le premier octet d'une clé SEC1 non compressée est toujours 0x04.
+    ui.deviceFingerprint.textContent = groupHex(state.identity.publicKeyHex.slice(2));
+    const pinned = await dbGet('agent');
+    if (pinned) ui.hostFingerprint.textContent = groupHex(pinned);
     setStatus('Prêt.');
-    ui.connect.hidden = false;
+    ui.unlock.hidden = false;
+    refreshOptions();
     navigator.serviceWorker?.register('/sw.js').catch(() => {});
   } catch (e) {
-    setStatus(`Identité locale indisponible : ${e.message}`, true);
+    setStatus(`Identité locale indisponible : ${e.message}`, { error: true });
   }
 })();

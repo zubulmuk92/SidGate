@@ -6,15 +6,20 @@
 //! qui permet de tenir 0,0 % de CPU au repos, puisqu'il n'y a alors littéralement
 //! aucune boucle en cours.
 //!
-//! Seuls des octets déjà compressés franchissent la frontière de thread.
+//! Seuls des octets déjà compressés franchissent la frontière de thread, avec
+//! trois valeurs minuscules que le client doit connaître : la position du
+//! curseur, sa forme, et la géométrie du bureau.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sidgate_capture::{CaptureError, DesktopInfo, FrameSource, FrameStatus};
+use sidgate_capture::{
+    CaptureError, DesktopInfo, FrameSource, FrameStatus, PointerShape, PointerState,
+};
 use sidgate_encode::{EncodedFrame, EncoderConfig, Submission};
+use tokio::sync::watch;
 
 use crate::config::VideoConfig;
 
@@ -30,6 +35,106 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(100);
 /// Volontairement minuscule : accumuler des images encodées, c'est accumuler de
 /// la latence. Au-delà, on jette — le client préfère toujours l'image suivante.
 pub const FRAME_QUEUE_DEPTH: usize = 3;
+
+/// Images écartées d'affilée en attendant une image clé avant de renoncer.
+///
+/// Deux secondes à 60 images par seconde. Un encodeur qui ignore la demande
+/// d'image clé ne doit pas figer l'écran pour toujours : passé ce délai, mieux
+/// vaut une image abîmée qu'une image arrêtée.
+const KEYFRAME_PATIENCE: u32 = 120;
+
+/// Ce que le thread de capture publie en dehors de la vidéo.
+///
+/// Trois valeurs « dernière écriture gagnante » : seul l'état courant compte,
+/// et un lecteur en retard ne veut pas rejouer l'historique.
+#[derive(Debug, Clone)]
+pub struct PipelineFeedback {
+    /// Position du curseur.
+    pub pointer: watch::Receiver<PointerState>,
+    /// Forme du curseur, absente tant que le compositeur n'en a livré aucune.
+    pub shape: watch::Receiver<Option<Arc<PointerShape>>>,
+    /// Géométrie du bureau capturé, qui change avec la résolution de l'hôte.
+    pub desktop: watch::Receiver<DesktopInfo>,
+}
+
+/// Côté écriture de [`PipelineFeedback`], détenu par le thread de capture.
+struct FeedbackSink {
+    pointer: watch::Sender<PointerState>,
+    shape: watch::Sender<Option<Arc<PointerShape>>>,
+    desktop: watch::Sender<DesktopInfo>,
+}
+
+impl FeedbackSink {
+    /// Publie ce qui a changé depuis le dernier tour.
+    fn publish(&self, capturer: &mut sidgate_capture::Capturer) {
+        let pointer = capturer.pointer();
+        self.pointer.send_if_modified(|current| {
+            let changed = *current != pointer;
+            *current = pointer;
+            changed
+        });
+        if let Some(shape) = capturer.take_pointer_shape() {
+            self.shape.send_replace(Some(Arc::new(shape)));
+        }
+    }
+
+    fn publish_desktop(&self, desktop: DesktopInfo) {
+        self.desktop.send_if_modified(|current| {
+            let changed = *current != desktop;
+            *current = desktop;
+            changed
+        });
+    }
+}
+
+/// Garde la chaîne de références de l'encodeur intacte côté client.
+///
+/// Le flux n'a pas d'images clés périodiques : chaque image s'appuie sur la
+/// précédente. En écarter une après encodage — file pleine — casse donc toutes
+/// les suivantes, sans que le client le sache : les paquets qu'il reçoit se
+/// suivent, mais décrivent des différences avec une image qu'il n'a jamais vue.
+///
+/// Dès qu'une image encodée est perdue, plus rien ne passe jusqu'à la prochaine
+/// image clé, que l'appelant doit réclamer à l'encodeur.
+#[derive(Debug, Default)]
+struct KeyframeGate {
+    waiting: bool,
+    discarded: u32,
+}
+
+impl KeyframeGate {
+    /// L'image peut-elle être transmise ?
+    fn admit(&mut self, keyframe: bool) -> bool {
+        if !self.waiting || keyframe {
+            return true;
+        }
+        self.discarded += 1;
+        if self.discarded >= KEYFRAME_PATIENCE {
+            tracing::warn!("aucune image clé obtenue de l'encodeur, reprise du flux tel quel");
+            self.waiting = false;
+            self.discarded = 0;
+            return true;
+        }
+        false
+    }
+
+    /// L'image a été transmise.
+    fn sent(&mut self, keyframe: bool) {
+        if keyframe {
+            self.waiting = false;
+            self.discarded = 0;
+        }
+    }
+
+    /// L'image a été perdue après encodage. Renvoie `true` s'il faut réclamer
+    /// une image clé : à la première perte, et de nouveau si c'est l'image clé
+    /// attendue qui vient d'être perdue.
+    fn lost(&mut self, keyframe: bool) -> bool {
+        let request = !self.waiting || keyframe;
+        self.waiting = true;
+        request
+    }
+}
 
 /// Ordres adressés au thread de capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +176,7 @@ pub struct PipelineStats {
 pub struct Pipeline {
     commands: Sender<PipelineCommand>,
     join: Option<std::thread::JoinHandle<()>>,
-    desktop: DesktopInfo,
+    feedback: PipelineFeedback,
     stats: Arc<PipelineStats>,
 }
 
@@ -84,6 +189,7 @@ impl Pipeline {
     /// thread mort derrière lui.
     pub fn start(
         video: &VideoConfig,
+        output: u32,
         bitrate_1080p: u32,
         frames_tx: tokio::sync::mpsc::Sender<EncodedFrame>,
     ) -> anyhow::Result<Self> {
@@ -96,14 +202,22 @@ impl Pipeline {
         let join = std::thread::Builder::new()
             .name("sidgate-capture".into())
             .spawn(move || {
-                run(video, bitrate_1080p, frames_tx, commands_rx, ready_tx, thread_stats);
+                run(
+                    video,
+                    output,
+                    bitrate_1080p,
+                    frames_tx,
+                    commands_rx,
+                    ready_tx,
+                    thread_stats,
+                );
             })?;
 
         match ready_rx.recv() {
-            Ok(Ok(desktop)) => Ok(Self {
+            Ok(Ok(feedback)) => Ok(Self {
                 commands: commands_tx,
                 join: Some(join),
-                desktop,
+                feedback,
                 stats,
             }),
             Ok(Err(e)) => {
@@ -119,9 +233,14 @@ impl Pipeline {
         }
     }
 
-    /// Géométrie du bureau capturé.
+    /// Géométrie courante du bureau capturé.
     pub fn desktop(&self) -> DesktopInfo {
-        self.desktop
+        *self.feedback.desktop.borrow()
+    }
+
+    /// Curseur et géométrie, publiés par le thread de capture.
+    pub fn feedback(&self) -> PipelineFeedback {
+        self.feedback.clone()
     }
 
     /// Compteurs de la session en cours.
@@ -155,90 +274,99 @@ impl Drop for Pipeline {
 /// Corps du thread de capture.
 fn run(
     video: VideoConfig,
+    output: u32,
     bitrate_1080p: u32,
     frames_tx: tokio::sync::mpsc::Sender<EncodedFrame>,
     commands: Receiver<PipelineCommand>,
-    ready: Sender<anyhow::Result<DesktopInfo>>,
+    ready: Sender<anyhow::Result<PipelineFeedback>>,
     stats: Arc<PipelineStats>,
 ) {
-    let mut engine = match Engine::new(&video, bitrate_1080p) {
+    let mut engine = match Engine::new(&video, output, bitrate_1080p) {
         Ok(engine) => engine,
         Err(e) => {
             let _ = ready.send(Err(e));
             return;
         }
     };
-    let desktop = engine.capturer.desktop();
-    if ready.send(Ok(desktop)).is_err() {
+
+    let (pointer_tx, pointer_rx) = watch::channel(engine.capturer.pointer());
+    let (shape_tx, shape_rx) = watch::channel(None);
+    let (desktop_tx, desktop_rx) = watch::channel(engine.capturer.desktop());
+    let feedback = FeedbackSink {
+        pointer: pointer_tx,
+        shape: shape_tx,
+        desktop: desktop_tx,
+    };
+    let published = PipelineFeedback {
+        pointer: pointer_rx,
+        shape: shape_rx,
+        desktop: desktop_rx,
+    };
+    if ready.send(Ok(published)).is_err() {
         return;
     }
 
     let start = Instant::now();
     let mut encoded = Vec::with_capacity(4);
+    let mut gate = KeyframeGate::default();
+    // Débit demandé en cours de session, à reconduire si l'encodeur est
+    // reconstruit : sans cela, un changement de résolution ramènerait le
+    // palier choisi par l'utilisateur à celui de la configuration.
+    let mut bitrate_override: Option<u32> = None;
     // Intervalle minimal entre deux soumissions. Le compositeur peut presenter
     // bien plus vite que la cadence demandee ; convertir puis jeter ces images
     // couterait du GPU et du CPU pour rien.
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(video.framerate.max(1)));
     let mut last_submit = Instant::now() - frame_interval;
+    // La texture du capteur porte-t-elle une image que le client n'a pas ?
+    //
+    // C'est le cas quand la dernière image capturée n'a pas été encodée —
+    // arrivée en avance sur la cadence, ou devant un encodeur occupé — et
+    // quand une image clé est demandée. Le compositeur ne présente rien tant
+    // que rien ne bouge : sans cette dette, la fin d'un geste rapide ou une
+    // image clé réclamée sur un bureau immobile n'arriveraient jamais.
+    let mut owed = false;
+    // La texture a-t-elle déjà reçu une image depuis l'ouverture du capteur ?
+    let mut has_frame = false;
 
-    loop {
-        match drain_commands(&commands, &mut engine) {
-            ControlFlow::Continue => {}
-            ControlFlow::Stop => break,
-        }
+    while drain_commands(&commands, &mut engine, &mut bitrate_override, &mut owed)
+        == ControlFlow::Continue
+    {
+        let timeout = acquire_timeout(owed && has_frame, last_submit.elapsed(), frame_interval);
+        let acquired = engine.capturer.acquire(timeout);
+        // Le curseur bouge aussi quand aucun pixel ne change : il se publie
+        // quel que soit le résultat de l'acquisition.
+        feedback.publish(&mut engine.capturer);
 
-        match engine.capturer.acquire(ACQUIRE_TIMEOUT) {
+        let fresh = match acquired {
             Ok(FrameStatus::Ready { .. }) => {
                 stats.captured.fetch_add(1, Ordering::Relaxed);
-
-                if last_submit.elapsed() < frame_interval {
-                    // Image en avance sur la cadence demandee : on la laisse
-                    // tomber tout de suite plutot que de payer la conversion.
-                    stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    if let Err(e) = engine.encoder.poll(&mut encoded) {
-                        tracing::error!(error = %e, "drainage de l'encodeur interrompu");
-                        break;
-                    }
-                } else {
-                    // Le chronometre demarre ici, et non avant l'acquisition :
-                    // y inclure l'attente d'une nouvelle image ferait passer un
-                    // bureau immobile pour un encodeur lent.
-                    let mark = Instant::now();
-                    match submit_within(&mut engine, start.elapsed(), &mut encoded, frame_interval)
-                    {
-                        Ok(Submission::Accepted) => {
-                            last_submit = Instant::now();
-                            stats.submitted.fetch_add(1, Ordering::Relaxed);
-                            stats
-                                .encode_us
-                                .fetch_add(mark.elapsed().as_micros() as u64, Ordering::Relaxed);
-                        }
-                        Ok(Submission::Busy) => {
-                            stats.dropped.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "encodage interrompu");
-                            break;
-                        }
-                    }
-                }
+                has_frame = true;
+                true
             }
             Ok(FrameStatus::Idle) => {
                 stats.idle.fetch_add(1, Ordering::Relaxed);
-                if let Err(e) = engine.encoder.poll(&mut encoded) {
-                    tracing::error!(error = %e, "drainage de l'encodeur interrompu");
-                    break;
-                }
+                false
             }
             Err(CaptureError::Lost) => {
                 // Bascule vers le bureau sécurisé, changement de résolution ou
                 // passage en plein écran exclusif. On reconstruit tout : un
                 // simple nouvel essai sur la même duplication échouerait.
                 tracing::warn!("duplication perdue, reconstruction du pipeline");
-                match Engine::new(&video, bitrate_1080p) {
+                match Engine::new(&video, output, bitrate_1080p) {
                     Ok(fresh) => {
                         engine = fresh;
+                        if let Some(bitrate) = bitrate_override {
+                            engine.encoder.set_bitrate(bitrate);
+                        }
                         engine.encoder.request_keyframe();
+                        // Un encodeur neuf repart d'une image clé : ce qui
+                        // restait à attendre de l'ancien n'a plus d'objet.
+                        gate = KeyframeGate::default();
+                        // Texture neuve, encore vide : plus rien n'est dû.
+                        owed = false;
+                        has_frame = false;
+                        feedback.publish_desktop(engine.capturer.desktop());
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "reconstruction impossible");
@@ -251,17 +379,64 @@ fn run(
                 tracing::error!(error = %e, "capture interrompue");
                 break;
             }
+        };
+
+        if (fresh || owed) && has_frame && last_submit.elapsed() >= frame_interval {
+            // Le chronometre demarre ici, et non avant l'acquisition : y
+            // inclure l'attente d'une nouvelle image ferait passer un bureau
+            // immobile pour un encodeur lent.
+            let mark = Instant::now();
+            match submit_within(&mut engine, start.elapsed(), &mut encoded, frame_interval) {
+                Ok(Submission::Accepted) => {
+                    last_submit = Instant::now();
+                    owed = false;
+                    stats.submitted.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .encode_us
+                        .fetch_add(mark.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
+                Ok(Submission::Busy) => {
+                    owed = true;
+                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "encodage interrompu");
+                    break;
+                }
+            }
+        } else {
+            if fresh {
+                // Image en avance sur la cadence demandee : on ne paie pas sa
+                // conversion maintenant, mais elle reste due si aucune autre
+                // ne vient la remplacer.
+                owed = true;
+                stats.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Err(e) = engine.encoder.poll(&mut encoded) {
+                tracing::error!(error = %e, "drainage de l'encodeur interrompu");
+                break;
+            }
         }
 
         for frame in encoded.drain(..) {
             stats.encoded.fetch_add(1, Ordering::Relaxed);
-            stats
-                .bytes
-                .fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+            let keyframe = frame.keyframe;
+            if !gate.admit(keyframe) {
+                stats.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let size = frame.data.len() as u64;
             match frames_tx.try_send(frame) {
-                Ok(()) => {}
+                Ok(()) => {
+                    gate.sent(keyframe);
+                    stats.bytes.fetch_add(size, Ordering::Relaxed);
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    if gate.lost(keyframe) {
+                        engine.encoder.request_keyframe();
+                        owed = true;
+                    }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     tracing::info!("plus de destinataire, arrêt du pipeline");
@@ -303,17 +478,47 @@ fn submit_within(
     }
 }
 
+#[derive(PartialEq, Eq)]
 enum ControlFlow {
     Continue,
     Stop,
 }
 
-fn drain_commands(commands: &Receiver<PipelineCommand>, engine: &mut Engine) -> ControlFlow {
+/// Durée d'attente de la prochaine image.
+///
+/// Quand une image est due au client, l'attente se réduit à ce qui reste avant
+/// que la cadence n'autorise à l'envoyer : la fin d'un geste part au plus une
+/// image plus tard, au lieu d'attendre un dixième de seconde qu'autre chose
+/// bouge.
+fn acquire_timeout(owed: bool, since_last_submit: Duration, frame_interval: Duration) -> Duration {
+    if !owed {
+        return ACQUIRE_TIMEOUT;
+    }
+    frame_interval
+        .saturating_sub(since_last_submit)
+        .clamp(Duration::from_millis(1), ACQUIRE_TIMEOUT)
+}
+
+fn drain_commands(
+    commands: &Receiver<PipelineCommand>,
+    engine: &mut Engine,
+    bitrate_override: &mut Option<u32>,
+    owed: &mut bool,
+) -> ControlFlow {
     loop {
         match commands.try_recv() {
-            Ok(PipelineCommand::Keyframe) => engine.encoder.request_keyframe(),
-            Ok(PipelineCommand::Bitrate(bitrate)) => engine.encoder.set_bitrate(bitrate),
-            Ok(PipelineCommand::Stop) | Err(TryRecvError::Disconnected) => return ControlFlow::Stop,
+            Ok(PipelineCommand::Keyframe) => {
+                engine.encoder.request_keyframe();
+                // À émettre même si plus rien ne bouge à l'écran.
+                *owed = true;
+            }
+            Ok(PipelineCommand::Bitrate(bitrate)) => {
+                *bitrate_override = Some(bitrate);
+                engine.encoder.set_bitrate(bitrate);
+            }
+            Ok(PipelineCommand::Stop) | Err(TryRecvError::Disconnected) => {
+                return ControlFlow::Stop
+            }
             Err(TryRecvError::Empty) => return ControlFlow::Continue,
         }
     }
@@ -326,8 +531,8 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(video: &VideoConfig, bitrate_1080p: u32) -> anyhow::Result<Self> {
-        let capturer = sidgate_capture::Capturer::new(video.output)?;
+    fn new(video: &VideoConfig, output: u32, bitrate_1080p: u32) -> anyhow::Result<Self> {
+        let capturer = sidgate_capture::Capturer::new(output)?;
         let desktop = capturer.desktop();
         let config = EncoderConfig {
             width: desktop.width,
@@ -497,6 +702,105 @@ mod tests {
             encode_us: 20_000,
         };
         assert_eq!(snap.encode_ms(), 2.0);
+    }
+
+    #[test]
+    fn nothing_owed_waits_the_full_timeout() {
+        let interval = Duration::from_millis(16);
+        assert_eq!(
+            acquire_timeout(false, Duration::ZERO, interval),
+            ACQUIRE_TIMEOUT
+        );
+        assert_eq!(
+            acquire_timeout(false, Duration::from_secs(5), interval),
+            ACQUIRE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn an_owed_frame_waits_only_for_the_cadence() {
+        let interval = Duration::from_millis(16);
+        // Soumise il y a 6 ms : la cadence autorise la suivante dans 10 ms.
+        assert_eq!(
+            acquire_timeout(true, Duration::from_millis(6), interval),
+            Duration::from_millis(10)
+        );
+        // Cadence déjà respectée : on ne laisse au compositeur qu'un instant
+        // pour présenter mieux, sans jamais boucler à vide.
+        assert_eq!(
+            acquire_timeout(true, Duration::from_secs(3), interval),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn an_owed_frame_never_waits_longer_than_an_idle_cycle() {
+        // Une image par seconde : la dette ne doit pas rendre le thread sourd
+        // aux commandes plus longtemps qu'un cycle ordinaire.
+        let interval = Duration::from_secs(1);
+        assert_eq!(
+            acquire_timeout(true, Duration::ZERO, interval),
+            ACQUIRE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn the_gate_is_open_until_a_frame_is_lost() {
+        let mut gate = KeyframeGate::default();
+        assert!(gate.admit(true));
+        gate.sent(true);
+        for _ in 0..10 {
+            assert!(gate.admit(false));
+            gate.sent(false);
+        }
+    }
+
+    #[test]
+    fn a_lost_frame_blocks_everything_until_the_next_keyframe() {
+        let mut gate = KeyframeGate::default();
+        assert!(gate.lost(false), "la première perte réclame une image clé");
+
+        // Les images déjà dans l'encodeur dépendent de celle qui manque.
+        assert!(!gate.admit(false));
+        assert!(!gate.admit(false));
+
+        assert!(gate.admit(true));
+        gate.sent(true);
+        assert!(gate.admit(false), "le flux reprend derrière l'image clé");
+    }
+
+    #[test]
+    fn further_losses_while_waiting_do_not_pile_up_requests() {
+        let mut gate = KeyframeGate::default();
+        assert!(gate.lost(false));
+        assert!(!gate.lost(false), "une demande est déjà en route");
+    }
+
+    #[test]
+    fn losing_the_awaited_keyframe_requests_another() {
+        let mut gate = KeyframeGate::default();
+        assert!(gate.lost(false));
+        assert!(gate.admit(true));
+        // L'image clé attendue arrive, mais la file est encore pleine.
+        assert!(
+            gate.lost(true),
+            "sans nouvelle demande, l'attente serait sans fin"
+        );
+        assert!(!gate.admit(false));
+    }
+
+    #[test]
+    fn the_gate_gives_up_on_an_encoder_that_never_delivers() {
+        let mut gate = KeyframeGate::default();
+        gate.lost(false);
+        for _ in 0..KEYFRAME_PATIENCE - 1 {
+            assert!(!gate.admit(false));
+        }
+        assert!(
+            gate.admit(false),
+            "une image abîmée vaut mieux qu'un écran figé"
+        );
+        assert!(gate.admit(false));
     }
 
     #[test]

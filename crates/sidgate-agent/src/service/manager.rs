@@ -186,7 +186,8 @@ fn SERVICE_STATUS_CURRENT(value: u32) -> u32 {
 
 fn open_manager(access: u32) -> anyhow::Result<ScHandle> {
     // SAFETY: aucune chaîne transmise ; le descripteur obtenu est possédé.
-    let handle = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), access) }.map_err(explain)?;
+    let handle =
+        unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), access) }.map_err(explain)?;
     Ok(ScHandle(handle))
 }
 

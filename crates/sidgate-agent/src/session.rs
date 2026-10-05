@@ -7,6 +7,22 @@
 //! Le pipeline de capture n'est démarré qu'une fois le transport `Connected`, et
 //! détruit dès qu'il ne l'est plus. Entre deux sessions, il n'existe pas : c'est
 //! littéralement ce qui donne 0,0 % de CPU au repos.
+//!
+//! # Pertes
+//!
+//! Le flux n'a pas d'images clés périodiques, pour ne pas payer leur pic de
+//! débit toutes les quelques secondes. La contrepartie est qu'une perte ne se
+//! répare pas toute seule ; trois mécanismes s'en chargent, du moins coûteux au
+//! plus coûteux :
+//!
+//! 1. le client réclame les paquets manquants (NACK) et l'agent les réémet
+//!    depuis un tampon — c'est le travail des intercepteurs enregistrés ici ;
+//! 2. si cela ne suffit pas, le client réclame une image clé (PLI ou FIR) ;
+//! 3. ses rapports de réception disent quelle part des paquets se perd, ce qui
+//!    permet de baisser le débit plutôt que de réparer indéfiniment.
+//!
+//! Les deux derniers ne peuvent être honorés que par l'application, et la pile
+//! ne lui remet aucun retour RTCP d'elle-même : voir le module `rtcp_forward`.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -15,14 +31,21 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use rtc::interceptor::Registry;
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
+use rtc::peer_connection::configuration::interceptor_registry::{
+    configure_nack, configure_rtcp_reports,
+};
+use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtcp::receiver_report::ReceiverReport;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
 use webrtc::data_channel::DataChannel;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
-use webrtc::media_stream::track_local::TrackLocal;
+use webrtc::media_stream::track_local::{TrackLocal, TrackLocalEvent};
 use webrtc::peer_connection::{
     MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
     RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer, RTCPeerConnectionIceEvent,
@@ -30,6 +53,8 @@ use webrtc::peer_connection::{
 };
 
 use sidgate_encode::EncodedFrame;
+
+use crate::rtcp_forward::RtcpForwarder;
 
 /// Identifiant du flux média annoncé dans le SDP.
 const STREAM_ID: &str = "sidgate";
@@ -46,6 +71,10 @@ pub enum SessionEvent {
     ConnectionState(RTCPeerConnectionState),
     /// Le client a ouvert un canal de données.
     DataChannel(Arc<dyn DataChannel>),
+    /// Le client ne peut plus décoder sans une nouvelle image clé.
+    KeyframeRequested,
+    /// Part de paquets vidéo perdus selon le client, sur 256.
+    LossReport(u8),
 }
 
 impl std::fmt::Debug for SessionEvent {
@@ -56,6 +85,8 @@ impl std::fmt::Debug for SessionEvent {
                 .field(&init.candidate)
                 .finish(),
             Self::ConnectionState(state) => f.debug_tuple("ConnectionState").field(state).finish(),
+            Self::KeyframeRequested => f.write_str("KeyframeRequested"),
+            Self::LossReport(fraction) => f.debug_tuple("LossReport").field(fraction).finish(),
             // `DataChannel` est un objet-trait sans `Debug` ; son étiquette ne
             // se lit qu'en asynchrone, ce qui n'a pas sa place ici.
             Self::DataChannel(_) => f.write_str("DataChannel(..)"),
@@ -97,6 +128,7 @@ impl PeerConnectionEventHandler for EventBridge {
 pub struct Session {
     peer: Arc<dyn PeerConnection>,
     track: Arc<TrackLocalStaticSample>,
+    events: mpsc::Sender<SessionEvent>,
     ssrc: u32,
     /// Fixé à la négociation, lu par la tâche d'émission : atomique pour que
     /// la session reste partageable entre tâches sans verrou.
@@ -130,6 +162,12 @@ impl Session {
             .register_default_codecs()
             .map_err(|e| anyhow::anyhow!("codecs par défaut indisponibles: {e}"))?;
 
+        // Réémission sur demande et rapports d'émission. Rien d'autre : ni
+        // estimation de bande passante côté émetteur ni diffusion simultanée,
+        // qui n'ont pas d'objet pour un flux unique vers un client unique.
+        let registry = configure_nack(Registry::new(), &mut media_engine);
+        let registry = configure_rtcp_reports(registry).with(RtcpForwarder::builder());
+
         let mut builder = RTCConfigurationBuilder::default();
         if !stun_servers.is_empty() {
             builder = builder.with_ice_servers(vec![RTCIceServer {
@@ -141,7 +179,10 @@ impl Session {
         let peer = PeerConnectionBuilder::new()
             .with_configuration(builder.build())
             .with_media_engine(media_engine)
-            .with_handler(Arc::new(EventBridge { events: events_tx }))
+            .with_interceptor_registry(registry)
+            .with_handler(Arc::new(EventBridge {
+                events: events_tx.clone(),
+            }))
             .with_udp_addrs(vec![bind])
             .build()
             .await
@@ -185,6 +226,7 @@ impl Session {
             Self {
                 peer: Arc::new(peer),
                 track,
+                events: events_tx,
                 ssrc,
                 payload_type: AtomicU8::new(payload_type),
             },
@@ -218,7 +260,11 @@ impl Session {
         if let Some(negotiated) = self.negotiated_payload_type().await {
             let previous = self.payload_type.swap(negotiated, Ordering::Relaxed);
             if negotiated != previous {
-                tracing::info!(from = previous, to = negotiated, "type de charge utile négocié");
+                tracing::info!(
+                    from = previous,
+                    to = negotiated,
+                    "type de charge utile négocié"
+                );
             }
         }
 
@@ -251,6 +297,32 @@ impl Session {
         if let Err(e) = self.peer.close().await {
             tracing::debug!(error = %e, "fermeture de la connexion");
         }
+    }
+
+    /// Démarre la lecture des retours RTCP du client sur la piste vidéo.
+    ///
+    /// À n'appeler qu'une fois le transport établi : avant, la piste n'est liée
+    /// à rien et la lecture se terminerait aussitôt. La tâche s'arrête
+    /// d'elle-même à la fermeture de la connexion.
+    pub fn spawn_feedback_reader(&self) -> tokio::task::JoinHandle<()> {
+        let track = Arc::clone(&self.track);
+        let events = self.events.clone();
+        let ssrc = self.ssrc;
+
+        tokio::spawn(async move {
+            while let Some(TrackLocalEvent::OnRtcpPacket(packets)) = track.poll().await {
+                for packet in &packets {
+                    let Some(feedback) = classify_feedback(packet.as_ref(), ssrc) else {
+                        continue;
+                    };
+                    tracing::trace!(?feedback, "retour RTCP du client");
+                    // `try_send` : si la boucle de session est débordée, un
+                    // retour perdu sera suivi d'un autre dans la seconde.
+                    let _ = events.try_send(feedback);
+                }
+            }
+            tracing::debug!("lecture des retours RTCP terminée");
+        })
     }
 
     /// Démarre la tâche qui pousse les images encodées sur la piste.
@@ -309,10 +381,27 @@ fn h264_codec() -> RTCRtpCodec {
         mime_type: "video/H264".to_owned(),
         clock_rate: VIDEO_CLOCK_RATE,
         channels: 0,
-        sdp_fmtp_line:
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_owned(),
+        sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+            .to_owned(),
         rtcp_feedback: Vec::new(),
     }
+}
+
+/// Traduit un paquet RTCP en événement de session, s'il nous concerne.
+///
+/// `ssrc` est celui de notre piste : un rapport qui porte sur une autre source
+/// ne dit rien de ce flux.
+fn classify_feedback(packet: &dyn rtc::rtcp::Packet, ssrc: u32) -> Option<SessionEvent> {
+    let any = packet.as_any();
+    if any.is::<PictureLossIndication>() || any.is::<FullIntraRequest>() {
+        return Some(SessionEvent::KeyframeRequested);
+    }
+    let report = any.downcast_ref::<ReceiverReport>()?;
+    report
+        .reports
+        .iter()
+        .find(|reception| reception.ssrc == ssrc)
+        .map(|reception| SessionEvent::LossReport(reception.fraction_lost))
 }
 
 /// Tire un SSRC non nul.
@@ -372,6 +461,50 @@ mod tests {
         assert!(is_connected(RTCPeerConnectionState::Connected));
         assert!(!is_connected(RTCPeerConnectionState::Connecting));
         assert!(!is_connected(RTCPeerConnectionState::New));
+    }
+
+    #[test]
+    fn keyframe_requests_are_recognised_in_both_forms() {
+        let pli = PictureLossIndication {
+            sender_ssrc: 1,
+            media_ssrc: 7,
+        };
+        assert!(matches!(
+            classify_feedback(&pli, 7),
+            Some(SessionEvent::KeyframeRequested)
+        ));
+        let fir = FullIntraRequest {
+            sender_ssrc: 1,
+            media_ssrc: 7,
+            fir: Vec::new(),
+        };
+        assert!(matches!(
+            classify_feedback(&fir, 7),
+            Some(SessionEvent::KeyframeRequested)
+        ));
+    }
+
+    #[test]
+    fn loss_is_read_from_the_report_about_our_stream_only() {
+        use rtc::rtcp::reception_report::ReceptionReport;
+        let about = |ssrc, fraction_lost| ReceptionReport {
+            ssrc,
+            fraction_lost,
+            ..Default::default()
+        };
+        let report = ReceiverReport {
+            ssrc: 99,
+            reports: vec![about(3, 200), about(7, 26)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            classify_feedback(&report, 7),
+            Some(SessionEvent::LossReport(26))
+        ));
+        assert!(
+            classify_feedback(&report, 42).is_none(),
+            "un rapport sur une autre source ne doit pas piloter notre débit"
+        );
     }
 
     #[test]

@@ -5,8 +5,11 @@
 // l'appareil client, et un écran de bureau mis en cache serait exactement ce
 // qu'on cherche à éviter.
 
-const CACHE = 'sidgate-v1';
-const SHELL = ['/', '/app.js', '/keymap.js', '/manifest.webmanifest'];
+const CACHE = 'sidgate-v2';
+const SHELL = [
+  '/', '/app.js', '/core.js', '/keymap.js', '/manifest.webmanifest',
+  '/icon.svg', '/icon-192.png', '/icon-512.png',
+];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));

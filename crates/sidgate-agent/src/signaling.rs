@@ -3,44 +3,56 @@
 //! L'agent sert lui-même la PWA, embarquée dans le binaire : aucun fichier à
 //! déployer à côté, et rien qu'un tiers puisse remplacer sur le disque.
 //!
-//! Une seule session à la fois. La limite n'est pas technique, elle est
-//! délibérée : deux clients pilotant simultanément la même souris ne donne
-//! jamais rien de bon, et un second visiteur ne doit pas pouvoir observer la
-//! session du premier.
+//! # Une session à la fois
+//!
+//! La limite n'est pas technique, elle est délibérée : deux clients pilotant
+//! simultanément la même souris ne donne jamais rien de bon, et un second
+//! visiteur ne doit pas pouvoir observer la session du premier.
+//!
+//! Un client **authentifié** qui se présente pendant une session la remplace :
+//! c'est le téléphone qu'on sort de sa poche alors que l'ordinateur portable
+//! est resté connecté. Tant qu'il ne s'est pas authentifié, un visiteur
+//! n'approche pas de la session en cours — il n'occupe qu'une place parmi les
+//! poignées de main en attente, qui sont comptées.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
-use axum::http::{header, StatusCode};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use bytes::BytesMut;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rand::TryRngCore;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify, Semaphore};
 
-use sidgate_input::InputSink;
+use sidgate_capture::{DesktopInfo, OutputInfo, PointerShape, PointerState};
+use sidgate_input::{AbsoluteMapping, InputSink, ScreenRect};
 use sidgate_proto::control::{
-    Capabilities, ControlCommand, ControlEvent, CursorMode, RejectReason, Stats,
+    Capabilities, ControlCommand, ControlEvent, DisplayInfo, QualityPreset, RejectReason, Stats,
 };
 use sidgate_proto::input::{InputFrame, SeqTracker};
+use sidgate_proto::pointer::{clamp_coordinate, PointerUpdate};
 use sidgate_proto::signaling::{
-    self, AuthError, ClientMessage, ServerMessage, NONCE_LEN,
+    self, AuthError, ClientMessage, CloseReason, ServerMessage, NONCE_LEN,
 };
 use sidgate_proto::{CHANNEL_CONTROL, CHANNEL_INPUT, PROTOCOL_VERSION};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::RTCIceCandidateInit;
 
+use crate::adapt::BitrateController;
 use crate::config::Config;
 use crate::control::{Dispatcher, Effect};
-use crate::identity::Identity;
-use crate::pipeline::{Pipeline, StatsSnapshot};
+use crate::identity::{Identity, Proof};
+use crate::pipeline::{Pipeline, PipelineFeedback, PipelineStats, StatsSnapshot};
+use crate::process::{ProcessMeter, ProcessSample};
 use crate::session::{self, Session, SessionEvent};
 use crate::tls::TlsMaterial;
 
@@ -50,12 +62,45 @@ const STATS_INTERVAL: Duration = Duration::from_secs(2);
 const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Délai maximal accordé au handshake d'authentification.
 ///
-/// Une connexion qui reste muette après le défi consomme l'unique emplacement
-/// de session ; la refermer d'office évite un déni de service trivial. Le délai
-/// est large parce qu'il court aussi pendant qu'un humain recopie un code
-/// d'appairage depuis l'écran de l'hôte — ce n'est pas ce délai qui protège du
-/// force brute, c'est la limitation de débit par source.
+/// Le délai est large parce qu'il court aussi pendant qu'un humain recopie un
+/// code d'appairage depuis l'écran de l'hôte — ce n'est pas ce délai qui
+/// protège du force brute, c'est la limitation de débit par source.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(180);
+/// Poignées de main simultanées tolérées avant authentification.
+///
+/// Chacune peut rester ouverte jusqu'à [`AUTH_TIMEOUT`] ; sans plafond, il
+/// suffirait d'ouvrir des connexions muettes pour épuiser l'agent.
+const MAX_PENDING_HANDSHAKES: usize = 8;
+/// Temps laissé à la session en cours pour se retirer devant un remplaçant.
+const TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Période de vérification qu'un client en session n'a pas été révoqué.
+const REVOCATION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Taille maximale d'un message de signalisation.
+///
+/// Une offre SDP pèse quelques kilo-octets. Le plafond par défaut de la
+/// bibliothèque, lui, se compte en dizaines de mégaoctets.
+const MAX_SIGNALING_MESSAGE: usize = 256 * 1024;
+/// Intervalle minimal entre deux images clés accordées au client.
+///
+/// Un client en difficulté en réclame une à chaque image qu'il ne peut pas
+/// décoder, et chacune pèse dix à trente fois une image ordinaire : toutes les
+/// lui servir saturerait le lien qui vient justement de perdre des paquets.
+const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(400);
+/// Intervalle minimal entre deux positions de curseur émises.
+///
+/// Une souris remonte jusqu'à mille positions par seconde ; l'écran du client
+/// en affiche soixante ou cent vingt.
+const POINTER_MIN_INTERVAL: Duration = Duration::from_millis(8);
+/// Plus grand côté d'une forme de curseur transmise au client.
+///
+/// Un message du canal de données est plafonné à 64 Ko. Une image de 96 pixels
+/// de côté en occupe 49 une fois encodée, et couvre les curseurs système
+/// jusqu'à une mise à l'échelle de 300 %.
+const MAX_SENT_POINTER_SIDE: u32 = 96;
+/// Taille maximale d'un message émis sur le canal de contrôle.
+const MAX_CONTROL_MESSAGE: usize = 60 * 1024;
+/// Taille maximale du texte de presse-papiers lu sur l'hôte.
+const MAX_CLIPBOARD_BYTES: usize = 32 * 1024;
 
 /// État partagé par toutes les connexions HTTP.
 pub struct AppState {
@@ -63,8 +108,25 @@ pub struct AppState {
     pub identity: Mutex<Identity>,
     /// Configuration de l'agent.
     pub config: Config,
-    /// Une session est-elle déjà en cours ?
-    pub busy: AtomicBool,
+    /// Places disponibles pour les poignées de main non authentifiées.
+    handshakes: Semaphore,
+    /// L'unique emplacement de session.
+    slot: tokio::sync::Mutex<()>,
+    /// De quoi demander à la session en cours de se retirer.
+    current: Mutex<Option<Arc<Notify>>>,
+}
+
+impl AppState {
+    /// État initial : aucune session, toutes les places libres.
+    pub fn new(identity: Identity, config: Config) -> Self {
+        Self {
+            identity: Mutex::new(identity),
+            config,
+            handshakes: Semaphore::new(MAX_PENDING_HANDSHAKES),
+            slot: tokio::sync::Mutex::new(()),
+            current: Mutex::new(None),
+        }
+    }
 }
 
 /// Démarre le serveur et ne rend la main qu'à son arrêt.
@@ -75,9 +137,13 @@ pub async fn serve(state: Arc<AppState>, tls: TlsMaterial) -> anyhow::Result<()>
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
+        .route("/core.js", get(core_js))
         .route("/keymap.js", get(keymap_js))
         .route("/sw.js", get(service_worker))
         .route("/manifest.webmanifest", get(manifest))
+        .route("/icon.svg", get(icon_svg))
+        .route("/icon-192.png", get(icon_192))
+        .route("/icon-512.png", get(icon_512))
         .route("/ws", get(websocket))
         .with_state(state);
 
@@ -87,7 +153,9 @@ pub async fn serve(state: Arc<AppState>, tls: TlsMaterial) -> anyhow::Result<()>
         let config =
             axum_server::tls_rustls::RustlsConfig::from_pem(tls.cert_pem, tls.key_pem).await?;
         tracing::info!(%address, "serveur prêt en HTTPS");
-        axum_server::bind_rustls(address, config).serve(service).await?;
+        axum_server::bind_rustls(address, config)
+            .serve(service)
+            .await?;
     } else {
         tracing::warn!(
             %address,
@@ -111,6 +179,10 @@ async fn app_js() -> Response {
     javascript(include_str!("../../../client/app.js"))
 }
 
+async fn core_js() -> Response {
+    javascript(include_str!("../../../client/core.js"))
+}
+
 async fn keymap_js() -> Response {
     javascript(include_str!("../../../client/keymap.js"))
 }
@@ -127,6 +199,18 @@ async fn manifest() -> Response {
         .into_response()
 }
 
+async fn icon_svg() -> Response {
+    image("image/svg+xml", include_bytes!("../../../client/icon.svg"))
+}
+
+async fn icon_192() -> Response {
+    image("image/png", include_bytes!("../../../client/icon-192.png"))
+}
+
+async fn icon_512() -> Response {
+    image("image/png", include_bytes!("../../../client/icon-512.png"))
+}
+
 fn html(body: &'static str) -> Response {
     (
         [
@@ -136,11 +220,12 @@ fn html(body: &'static str) -> Response {
             (
                 header::CONTENT_SECURITY_POLICY,
                 "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-                 img-src 'self' data:; media-src 'self' blob:; connect-src 'self' ws: wss:; \
+                 img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; \
                  base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
             ),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::REFERRER_POLICY, "no-referrer"),
+            (header::CACHE_CONTROL, "no-cache"),
         ],
         body,
     )
@@ -152,6 +237,19 @@ fn javascript(body: &'static str) -> Response {
         [
             (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn image(content_type: &'static str, body: &'static [u8]) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
         ],
         body,
     )
@@ -160,26 +258,27 @@ fn javascript(body: &'static str) -> Response {
 
 // --- Signalisation ----------------------------------------------------------
 
+type WsSink = SplitSink<WebSocket, Message>;
+type WsStream = SplitStream<WebSocket>;
+
 async fn websocket(
     upgrade: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
-    if state
-        .busy
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        tracing::warn!(%peer, "session déjà en cours, connexion refusée");
-        return (StatusCode::CONFLICT, "une session est déjà en cours").into_response();
-    }
-    upgrade.on_upgrade(move |socket| async move {
-        let outcome = run_connection(socket, Arc::clone(&state), peer.ip()).await;
-        if let Err(e) = outcome {
-            tracing::warn!(%peer, error = %e, "session terminée sur erreur");
-        }
-        state.busy.store(false, Ordering::Release);
-    })
+    upgrade
+        .max_message_size(MAX_SIGNALING_MESSAGE)
+        .on_upgrade(move |socket| async move {
+            if let Err(e) = run_connection(socket, state, peer.ip()).await {
+                tracing::warn!(%peer, error = %e, "connexion terminée sur erreur");
+            }
+        })
+}
+
+async fn send(sink: &mut WsSink, message: &ServerMessage) -> anyhow::Result<()> {
+    sink.send(Message::Text(serde_json::to_string(message)?.into()))
+        .await?;
+    Ok(())
 }
 
 /// Déroule une connexion complète : authentification, négociation, session.
@@ -189,6 +288,17 @@ async fn run_connection(
     peer: IpAddr,
 ) -> anyhow::Result<()> {
     let (mut sink, mut stream) = socket.split();
+
+    let Ok(permit) = state.handshakes.try_acquire() else {
+        tracing::warn!(%peer, "trop de poignées de main en attente, connexion refusée");
+        return send(
+            &mut sink,
+            &ServerMessage::Closed {
+                reason: CloseReason::Busy,
+            },
+        )
+        .await;
+    };
 
     let server_nonce = random_nonce()?;
     // Un seul verrou pour les deux lectures : `parking_lot::Mutex` n'est pas
@@ -204,27 +314,27 @@ async fn run_connection(
         }
     };
     tracing::debug!(%peer, "défi émis");
-    sink.send(Message::Text(serde_json::to_string(&challenge)?.into()))
-        .await?;
+    send(&mut sink, &challenge).await?;
 
-    let authenticated =
-        match tokio::time::timeout(AUTH_TIMEOUT, authenticate(&mut stream, &state, peer, &server_nonce))
-            .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                tracing::warn!(%peer, "handshake abandonné, délai dépassé");
-                return Ok(());
-            }
-        };
+    let authenticated = match tokio::time::timeout(
+        AUTH_TIMEOUT,
+        authenticate(&mut stream, &state, peer, &server_nonce),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            tracing::warn!(%peer, "handshake abandonné, délai dépassé");
+            return Ok(());
+        }
+    };
+    drop(permit);
 
     let (client_key, client_nonce) = match authenticated {
         Ok(pair) => pair,
         Err(reason) => {
-            let message = ServerMessage::AuthFailed { reason };
-            sink.send(Message::Text(serde_json::to_string(&message)?.into()))
-                .await?;
+            send(&mut sink, &ServerMessage::AuthFailed { reason }).await?;
             tracing::warn!(%peer, ?reason, "authentification refusée");
             return Ok(());
         }
@@ -241,18 +351,50 @@ async fn run_connection(
         agent_signature,
         session_id: session_id.clone(),
     };
-    sink.send(Message::Text(serde_json::to_string(&ok)?.into()))
-        .await?;
+    send(&mut sink, &ok).await?;
     tracing::info!(%peer, session = %session_id, "client authentifié");
 
-    run_session(sink, stream, state, session_id).await
+    // À partir d'ici le client a prouvé son identité : il a le droit de
+    // prendre la place de la session en cours.
+    let kick = Arc::new(Notify::new());
+    if let Some(previous) = state.current.lock().replace(Arc::clone(&kick)) {
+        tracing::warn!(session = %session_id, "session en cours remplacée par ce client");
+        previous.notify_one();
+    }
+    let slot = match tokio::time::timeout(TAKEOVER_TIMEOUT, state.slot.lock()).await {
+        Ok(slot) => slot,
+        Err(_) => {
+            release_current(&state, &kick);
+            tracing::error!(session = %session_id, "la session précédente ne s'est pas retirée");
+            return send(
+                &mut sink,
+                &ServerMessage::Error {
+                    message: "La session précédente ne s'est pas terminée.".into(),
+                },
+            )
+            .await;
+        }
+    };
+
+    let outcome = run_session(sink, stream, &state, &session_id, &client_key, &kick).await;
+    release_current(&state, &kick);
+    drop(slot);
+    outcome
+}
+
+/// Oublie la poignée de remplacement d'une session, si c'est encore la sienne.
+fn release_current(state: &AppState, kick: &Arc<Notify>) {
+    let mut current = state.current.lock();
+    if current.as_ref().is_some_and(|held| Arc::ptr_eq(held, kick)) {
+        *current = None;
+    }
 }
 
 type AuthOutcome = Result<(String, [u8; NONCE_LEN]), AuthError>;
 
 /// Attend et vérifie le message d'authentification ou d'appairage.
 async fn authenticate(
-    stream: &mut futures_util::stream::SplitStream<WebSocket>,
+    stream: &mut WsStream,
     state: &Arc<AppState>,
     peer: IpAddr,
     server_nonce: &[u8; NONCE_LEN],
@@ -281,10 +423,16 @@ async fn authenticate(
                 let Some(nonce) = signaling::from_hex_exact::<NONCE_LEN>(&client_nonce) else {
                     return Ok(Err(AuthError::Rejected));
                 };
+                let proof = Proof {
+                    client_key_hex: &client_key,
+                    server_nonce,
+                    client_nonce: &nonce,
+                    signature_hex: &signature,
+                };
                 state
                     .identity
                     .lock()
-                    .authenticate(peer, &client_key, server_nonce, &nonce, &signature)
+                    .authenticate(peer, proof)
                     .map(|key| (key, nonce))
             }
             ClientMessage::Pair {
@@ -301,18 +449,16 @@ async fn authenticate(
                 let Some(nonce) = signaling::from_hex_exact::<NONCE_LEN>(&client_nonce) else {
                     return Ok(Err(AuthError::Rejected));
                 };
+                let proof = Proof {
+                    client_key_hex: &client_key,
+                    server_nonce,
+                    client_nonce: &nonce,
+                    signature_hex: &signature,
+                };
                 state
                     .identity
                     .lock()
-                    .pair(
-                        peer,
-                        &code,
-                        &client_key,
-                        &label,
-                        server_nonce,
-                        &nonce,
-                        &signature,
-                    )
+                    .pair(peer, &code, &label, proof)
                     .map(|key| (key, nonce))
             }
             _ => Err(AuthError::UnexpectedMessage),
@@ -321,18 +467,125 @@ async fn authenticate(
     Ok(Err(AuthError::UnexpectedMessage))
 }
 
+// --- Session ----------------------------------------------------------------
+
+/// Pourquoi une session s'est terminée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndReason {
+    /// Le client a dit au revoir.
+    ClientLeft,
+    /// Le canal de signalisation s'est fermé.
+    SignalingClosed,
+    /// Le transport WebRTC est tombé.
+    TransportLost,
+    /// Un autre client appairé a pris la place.
+    Replaced,
+    /// Le client a été révoqué pendant sa session.
+    Revoked,
+    /// La négociation a échoué.
+    Failed,
+}
+
+impl EndReason {
+    /// La fin de session doit-elle verrouiller le poste ?
+    ///
+    /// Toujours, sauf quand un client autorisé en remplace un autre : la
+    /// session ne s'interrompt pas, elle change de mains, et verrouiller
+    /// accueillerait le nouveau venu sur l'écran de verrouillage.
+    fn triggers_killswitch(self) -> bool {
+        !matches!(self, Self::Replaced)
+    }
+}
+
+/// Sonde de latence applicative.
+///
+/// Une sonde part avec chaque remontée de télémétrie ; la réponse du client
+/// donne l'aller-retour vu par l'application, files d'attente comprises.
+#[derive(Debug, Default)]
+struct Probe {
+    next_seq: u32,
+    pending: Option<(u32, Instant)>,
+    rtt_ms: Option<f32>,
+}
+
+impl Probe {
+    /// Prépare une nouvelle sonde et renvoie son numéro.
+    ///
+    /// Si la précédente est restée sans réponse, la dernière mesure est
+    /// périmée : elle redevient inconnue plutôt que de rester affichée.
+    fn begin(&mut self, now: Instant) -> u32 {
+        if self.pending.is_some() {
+            self.rtt_ms = None;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.pending = Some((seq, now));
+        seq
+    }
+
+    /// Enregistre la réponse à la sonde `seq`. Une réponse à une sonde
+    /// ancienne ou jamais émise est ignorée.
+    fn complete(&mut self, seq: u32, now: Instant) {
+        if let Some((expected, sent)) = self.pending {
+            if expected == seq {
+                self.rtt_ms = Some(now.duration_since(sent).as_secs_f32() * 1000.0);
+                self.pending = None;
+            }
+        }
+    }
+}
+
 /// État partagé entre les tâches d'une même session.
 struct SessionRuntime {
+    session: Session,
+    config: Config,
     dispatcher: Mutex<Dispatcher>,
     sink: Mutex<sidgate_input::Sink>,
     pipeline: Mutex<Option<Pipeline>>,
+    /// Sérialise les démarrages du pipeline : la reprise de capture et le
+    /// changement d'écran peuvent le demander au même instant.
+    starting: tokio::sync::Mutex<()>,
     seq: Mutex<SeqTracker>,
     control: Mutex<Option<Arc<dyn DataChannel>>>,
-    cursor_absolute: AtomicBool,
+    input: Mutex<Option<Arc<dyn DataChannel>>>,
+    /// Sortie vidéo capturée, modifiable par le client.
+    output: AtomicU32,
+    outputs: Mutex<Vec<OutputInfo>>,
+    /// Palier choisi par le client, reconduit quand le pipeline redémarre.
+    preset: Mutex<QualityPreset>,
+    bitrate: Mutex<BitrateController>,
+    probe: Mutex<Probe>,
+    pointer_seq: AtomicU32,
+    last_keyframe: Mutex<Option<Instant>>,
+    last_stats: Mutex<Option<Stats>>,
     rejected_inputs: AtomicU64,
 }
 
 impl SessionRuntime {
+    fn new(session: Session, config: Config) -> Self {
+        let preset = config.video.quality;
+        Self {
+            session,
+            dispatcher: Mutex::new(Dispatcher::new(config.security.clone(), 0, 0)),
+            sink: Mutex::new(sidgate_input::Sink::new()),
+            pipeline: Mutex::new(None),
+            starting: tokio::sync::Mutex::new(()),
+            seq: Mutex::new(SeqTracker::new()),
+            control: Mutex::new(None),
+            input: Mutex::new(None),
+            output: AtomicU32::new(config.video.output),
+            outputs: Mutex::new(Vec::new()),
+            preset: Mutex::new(preset),
+            bitrate: Mutex::new(BitrateController::new(preset.target_bitrate_1080p())),
+            probe: Mutex::new(Probe::default()),
+            pointer_seq: AtomicU32::new(0),
+            last_keyframe: Mutex::new(None),
+            last_stats: Mutex::new(None),
+            rejected_inputs: AtomicU64::new(0),
+            config,
+        }
+    }
+
     /// Envoie un événement sur le canal fiable, si celui-ci est ouvert.
     async fn emit(&self, event: ControlEvent) {
         let channel = self.control.lock().clone();
@@ -340,18 +593,82 @@ impl SessionRuntime {
         let Ok(text) = serde_json::to_string(&event) else {
             return;
         };
+        if text.len() > MAX_CONTROL_MESSAGE {
+            tracing::warn!(bytes = text.len(), "événement trop volumineux, non émis");
+            return;
+        }
         if let Err(e) = channel.send_text(&text).await {
             tracing::debug!(error = %e, "émission sur le canal de contrôle");
         }
+    }
+
+    /// Envoie la position du curseur sur le canal non fiable.
+    async fn send_pointer(&self, pointer: PointerState) {
+        let channel = self.input.lock().clone();
+        let Some(channel) = channel else { return };
+        let update = PointerUpdate {
+            seq: self.pointer_seq.fetch_add(1, Ordering::Relaxed),
+            x: clamp_coordinate(pointer.x),
+            y: clamp_coordinate(pointer.y),
+            visible: pointer.visible,
+        };
+        let _ = channel.send(BytesMut::from(&update.encode()[..])).await;
+    }
+
+    /// Demande une image clé au pipeline, sans dépasser la cadence permise.
+    fn request_keyframe(&self) {
+        let now = Instant::now();
+        {
+            let mut last = self.last_keyframe.lock();
+            if last.is_some_and(|at| now.duration_since(at) < KEYFRAME_MIN_INTERVAL) {
+                return;
+            }
+            *last = Some(now);
+        }
+        if let Some(pipeline) = self.pipeline.lock().as_ref() {
+            pipeline.request_keyframe();
+            tracing::debug!("image clé demandée par le client");
+        }
+    }
+
+    /// Ajuste le débit d'après la part de paquets perdus rapportée.
+    fn on_loss_report(&self, fraction_lost: u8) {
+        if !self.config.video.adaptive_bitrate {
+            return;
+        }
+        let Some(bitrate) = self.bitrate.lock().on_report(fraction_lost, Instant::now()) else {
+            return;
+        };
+        if let Some(pipeline) = self.pipeline.lock().as_ref() {
+            pipeline.set_bitrate(bitrate);
+            tracing::info!(
+                bitrate,
+                loss_percent = f32::from(fraction_lost) * 100.0 / 256.0,
+                "débit adapté aux pertes"
+            );
+        }
+    }
+
+    /// Le pipeline courant est-il celui auquel appartiennent ces compteurs ?
+    ///
+    /// Les tâches lancées pour un pipeline s'en servent pour s'arrêter quand
+    /// il est remplacé, au changement d'écran par exemple.
+    fn owns(&self, stats: &Arc<PipelineStats>) -> bool {
+        self.pipeline
+            .lock()
+            .as_ref()
+            .is_some_and(|pipeline| Arc::ptr_eq(pipeline.stats(), stats))
     }
 }
 
 /// Boucle principale d'une session authentifiée.
 async fn run_session(
-    mut ws_tx: futures_util::stream::SplitSink<WebSocket, Message>,
-    mut ws_rx: futures_util::stream::SplitStream<WebSocket>,
-    state: Arc<AppState>,
-    session_id: String,
+    mut ws_tx: WsSink,
+    mut ws_rx: WsStream,
+    state: &Arc<AppState>,
+    session_id: &str,
+    client_key: &str,
+    kick: &Notify,
 ) -> anyhow::Result<()> {
     let bind = SocketAddr::new(state.config.network.bind, 0);
     let (session, mut events) = Session::new(
@@ -360,36 +677,42 @@ async fn run_session(
         state.config.video.framerate,
     )
     .await?;
-    let session = Arc::new(session);
-
-    let runtime = Arc::new(SessionRuntime {
-        dispatcher: Mutex::new(Dispatcher::new(state.config.security.clone(), 0, 0)),
-        sink: Mutex::new(sidgate_input::Sink::new()),
-        pipeline: Mutex::new(None),
-        seq: Mutex::new(SeqTracker::new()),
-        control: Mutex::new(None),
-        cursor_absolute: AtomicBool::new(false),
-        rejected_inputs: AtomicU64::new(0),
-    });
+    let runtime = Arc::new(SessionRuntime::new(session, state.config.clone()));
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut streaming = false;
+    let mut revocation = tokio::time::interval(REVOCATION_CHECK_INTERVAL);
+    revocation.tick().await;
 
-    loop {
+    // Toutes les sorties de boucle passent par un motif : la fermeture qui
+    // suit — relâchement des touches, arrêt de la capture, verrouillage — ne
+    // doit être sautée sur aucun chemin, erreur comprise.
+    let reason = loop {
         tokio::select! {
             incoming = ws_rx.next() => {
-                let Some(message) = incoming else { break };
-                match message? {
-                    Message::Text(text) => {
-                        if !handle_client_message(&text, &session, &mut ws_tx).await? {
-                            break;
-                        }
+                let text = match incoming {
+                    Some(Ok(Message::Text(text))) => text,
+                    Some(Ok(Message::Close(_))) | None => break EndReason::SignalingClosed,
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => {
+                        tracing::warn!(session = %session_id, error = %e, "signalisation interrompue");
+                        break EndReason::SignalingClosed;
                     }
-                    Message::Close(_) => break,
-                    _ => {}
+                };
+                match handle_client_message(&text, &runtime.session, &mut ws_tx).await {
+                    Ok(true) => {}
+                    Ok(false) => break EndReason::ClientLeft,
+                    Err(e) => {
+                        tracing::warn!(session = %session_id, error = %e, "négociation en échec");
+                        let _ = send(&mut ws_tx, &ServerMessage::Error {
+                            message: "La négociation du flux a échoué.".into(),
+                        }).await;
+                        break EndReason::Failed;
+                    }
                 }
             }
             event = events.recv() => {
-                let Some(event) = event else { break };
+                let Some(event) = event else { break EndReason::TransportLost };
                 match event {
                     SessionEvent::IceCandidate(init) => {
                         let message = ServerMessage::Candidate {
@@ -397,37 +720,57 @@ async fn run_session(
                             sdp_mid: init.sdp_mid,
                             sdp_mline_index: init.sdp_mline_index,
                         };
-                        ws_tx
-                            .send(Message::Text(serde_json::to_string(&message)?.into()))
-                            .await?;
+                        if send(&mut ws_tx, &message).await.is_err() {
+                            break EndReason::SignalingClosed;
+                        }
                     }
                     SessionEvent::DataChannel(channel) => {
                         tasks.push(spawn_channel(channel, Arc::clone(&runtime)));
                     }
                     SessionEvent::ConnectionState(connection_state) => {
                         if session::is_connected(connection_state) {
-                            tasks.extend(
-                                start_streaming(&session, &runtime, &state).await,
-                            );
+                            if !streaming {
+                                streaming = true;
+                                tasks.push(runtime.session.spawn_feedback_reader());
+                                tasks.extend(start_streaming(&runtime).await);
+                            }
                         } else if session::is_terminal(connection_state) {
                             tracing::warn!(session = %session_id, ?connection_state, "transport perdu");
-                            break;
+                            break EndReason::TransportLost;
                         }
                     }
+                    SessionEvent::KeyframeRequested => runtime.request_keyframe(),
+                    SessionEvent::LossReport(fraction_lost) => runtime.on_loss_report(fraction_lost),
+                }
+            }
+            () = kick.notified() => break EndReason::Replaced,
+            _ = revocation.tick() => {
+                if !state.identity.lock().is_authorized(client_key) {
+                    tracing::warn!(session = %session_id, "client révoqué en cours de session");
+                    break EndReason::Revoked;
                 }
             }
         }
-    }
+    };
 
-    teardown(&session, &runtime, tasks, &session_id).await;
+    if reason == EndReason::Replaced {
+        let _ = send(
+            &mut ws_tx,
+            &ServerMessage::Closed {
+                reason: CloseReason::Replaced,
+            },
+        )
+        .await;
+    }
+    teardown(&runtime, tasks, session_id, reason).await;
     Ok(())
 }
 
 /// Traite un message de signalisation du client. Renvoie `false` pour fermer.
 async fn handle_client_message(
     text: &str,
-    session: &Arc<Session>,
-    ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    session: &Session,
+    ws_tx: &mut WsSink,
 ) -> anyhow::Result<bool> {
     let Ok(message) = serde_json::from_str::<ClientMessage>(text) else {
         tracing::warn!("message de signalisation illisible");
@@ -437,16 +780,22 @@ async fn handle_client_message(
     match message {
         ClientMessage::Offer { sdp } => {
             let answer = session.accept_offer(sdp).await?;
-            let message = ServerMessage::Answer { sdp: answer };
-            ws_tx
-                .send(Message::Text(serde_json::to_string(&message)?.into()))
-                .await?;
+            send(ws_tx, &ServerMessage::Answer { sdp: answer }).await?;
         }
         ClientMessage::Candidate {
             candidate,
             sdp_mid,
             sdp_mline_index,
         } => {
+            if is_mdns_candidate(&candidate) {
+                // Un navigateur masque ses adresses locales derrière un nom
+                // `.local` à résoudre par diffusion sur le réseau physique.
+                // L'agent n'émet rien hors de son interface d'écoute : le
+                // candidat est ignoré, et la connexion s'établit depuis les
+                // nôtres, que le client reçoit de toute façon.
+                tracing::debug!("candidat mDNS ignoré");
+                return Ok(true);
+            }
             let init = RTCIceCandidateInit {
                 candidate,
                 sdp_mid,
@@ -467,18 +816,25 @@ async fn handle_client_message(
     Ok(true)
 }
 
+/// Le candidat ICE désigne-t-il un nom mDNS plutôt qu'une adresse ?
+///
+/// Une ligne de candidat se lit `candidate:<fondation> <composant> <transport>
+/// <priorité> <adresse> <port> typ …` : l'adresse est le cinquième champ.
+fn is_mdns_candidate(candidate: &str) -> bool {
+    candidate
+        .split_ascii_whitespace()
+        .nth(4)
+        .is_some_and(|address| address.to_ascii_lowercase().ends_with(".local"))
+}
+
 /// Démarre le pipeline et les tâches d'émission une fois le transport établi.
 ///
 /// Un bureau momentanément inaccessible — session hôte verrouillée, bureau
 /// sécurisé — ne met pas fin à la session : le client reste connecté, en est
 /// informé, et la vidéo démarre dès que la capture redevient possible. Couper
 /// la session dans ce cas obligerait à tout renégocier au déverrouillage.
-async fn start_streaming(
-    session: &Arc<Session>,
-    runtime: &Arc<SessionRuntime>,
-    state: &Arc<AppState>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    match try_start_pipeline(session, runtime, state).await {
+async fn start_streaming(runtime: &Arc<SessionRuntime>) -> Option<tokio::task::JoinHandle<()>> {
+    match try_start_pipeline(runtime).await {
         Ok(()) => None,
         Err(e) if is_desktop_unavailable(&e) => {
             tracing::warn!(error = %e, "capture différée");
@@ -487,11 +843,7 @@ async fn start_streaming(
                     message: e.to_string(),
                 })
                 .await;
-            Some(spawn_capture_retry(
-                Arc::clone(session),
-                Arc::clone(runtime),
-                Arc::clone(state),
-            ))
+            Some(spawn_capture_retry(Arc::clone(runtime)))
         }
         Err(e) => {
             tracing::error!(error = %e, "démarrage du pipeline impossible");
@@ -514,17 +866,13 @@ fn is_desktop_unavailable(error: &anyhow::Error) -> bool {
 }
 
 /// Réessaie d'ouvrir la capture jusqu'à ce que le bureau redevienne accessible.
-fn spawn_capture_retry(
-    session: Arc<Session>,
-    runtime: Arc<SessionRuntime>,
-    state: Arc<AppState>,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_capture_retry(runtime: Arc<SessionRuntime>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(CAPTURE_RETRY_INTERVAL);
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match try_start_pipeline(&session, &runtime, &state).await {
+            match try_start_pipeline(&runtime).await {
                 Ok(()) => {
                     runtime.emit(ControlEvent::CaptureResumed).await;
                     tracing::info!("capture reprise");
@@ -540,56 +888,238 @@ fn spawn_capture_retry(
     })
 }
 
-/// Tentative unique de démarrage du pipeline.
-async fn try_start_pipeline(
-    session: &Arc<Session>,
-    runtime: &Arc<SessionRuntime>,
-    state: &Arc<AppState>,
-) -> anyhow::Result<()> {
+/// Tentative unique de démarrage du pipeline. Sans effet s'il tourne déjà.
+async fn try_start_pipeline(runtime: &Arc<SessionRuntime>) -> anyhow::Result<()> {
+    let _starting = runtime.starting.lock().await;
     if runtime.pipeline.lock().is_some() {
         return Ok(());
     }
 
     let (frames_tx, frames_rx) = mpsc::channel(crate::pipeline::FRAME_QUEUE_DEPTH);
-    let bitrate = state.config.video.quality.target_bitrate_1080p();
-    let pipeline = Pipeline::start(&state.config.video, bitrate, frames_tx)?;
+    let output = runtime.output.load(Ordering::Relaxed);
+    let preset = *runtime.preset.lock();
+    // L'ouverture de la duplication et de l'encodeur prend quelques centaines
+    // de millisecondes d'appels système bloquants.
+    let pipeline = tokio::task::block_in_place(|| {
+        Pipeline::start(
+            &runtime.config.video,
+            output,
+            preset.target_bitrate_1080p(),
+            frames_tx,
+        )
+    })?;
     let desktop = pipeline.desktop();
+    let feedback = pipeline.feedback();
+    let stats = Arc::clone(pipeline.stats());
 
-    *runtime.dispatcher.lock() =
-        Dispatcher::new(state.config.security.clone(), desktop.width, desktop.height);
-    let stats_handle = Arc::clone(pipeline.stats());
+    apply_geometry(runtime, desktop);
+    let ceiling = runtime.dispatcher.lock().bitrate_for(preset);
+    *runtime.bitrate.lock() = BitrateController::new(ceiling);
     *runtime.pipeline.lock() = Some(pipeline);
 
-    session.spawn_video_sender(frames_rx, state.config.video.framerate);
-    spawn_stats_reporter(Arc::clone(runtime), stats_handle);
-
     runtime
-        .emit(ControlEvent::Hello {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            capabilities: Capabilities {
-                power_actions: state.config.security.allow_power_actions,
-                input_injection: state.config.security.allow_input,
-                video_codec: "H264".to_string(),
-                width: desktop.width,
-                height: desktop.height,
-            },
-        })
-        .await;
+        .session
+        .spawn_video_sender(frames_rx, runtime.config.video.framerate);
+    spawn_stats_reporter(Arc::clone(runtime), stats);
+    spawn_feedback_forwarder(Arc::clone(runtime), feedback);
+
+    announce(runtime).await;
 
     tracing::info!(
         width = desktop.width,
         height = desktop.height,
+        output = desktop.output_index,
         "diffusion démarrée"
     );
     Ok(())
 }
 
+/// Arrête le pipeline courant, s'il existe.
+fn stop_pipeline(runtime: &SessionRuntime) {
+    let pipeline = runtime.pipeline.lock().take();
+    // La destruction attend la fin du thread de capture.
+    tokio::task::block_in_place(|| drop(pipeline));
+}
+
+/// Aligne le dispatcher et l'injection d'entrées sur le bureau capturé.
+fn apply_geometry(runtime: &SessionRuntime, desktop: DesktopInfo) {
+    let outputs =
+        tokio::task::block_in_place(sidgate_capture::enumerate_outputs).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "énumération des écrans impossible");
+            Vec::new()
+        });
+    let rects: Vec<ScreenRect> = outputs.iter().map(output_rect).collect();
+    let target = ScreenRect {
+        left: desktop.left,
+        top: desktop.top,
+        width: desktop.width,
+        height: desktop.height,
+    };
+
+    runtime
+        .dispatcher
+        .lock()
+        .set_geometry(desktop.width, desktop.height, outputs.len() as u32);
+    runtime
+        .sink
+        .lock()
+        .set_mapping(Some(AbsoluteMapping::new(target, &rects)));
+    *runtime.outputs.lock() = outputs;
+}
+
+fn output_rect(output: &OutputInfo) -> ScreenRect {
+    ScreenRect {
+        left: output.left,
+        top: output.top,
+        width: output.width,
+        height: output.height,
+    }
+}
+
+/// Annonce au client l'état courant : capacités, écrans, forme du curseur.
+///
+/// Appelée au démarrage du pipeline *et* à l'ouverture du canal de contrôle :
+/// l'ordre des deux n'est pas garanti, et le premier arrivé n'a pas encore de
+/// quoi parler ou pas encore à qui. Le client traite l'annonce comme un état,
+/// pas comme un événement : la recevoir deux fois est sans effet.
+async fn announce(runtime: &SessionRuntime) {
+    let Some((desktop, shape, pointer)) = runtime.pipeline.lock().as_ref().map(|pipeline| {
+        let feedback = pipeline.feedback();
+        let shape = feedback.shape.borrow().clone();
+        let pointer = *feedback.pointer.borrow();
+        (pipeline.desktop(), shape, pointer)
+    }) else {
+        return;
+    };
+
+    let displays = runtime
+        .outputs
+        .lock()
+        .iter()
+        .map(|output| DisplayInfo {
+            index: output.index,
+            width: output.width,
+            height: output.height,
+            primary: output.is_primary(),
+        })
+        .collect();
+    let security = &runtime.config.security;
+    // Lu avant l'émission : un garde de verrou ne doit pas survivre à un
+    // point d'attente.
+    let quality = *runtime.preset.lock();
+
+    runtime
+        .emit(ControlEvent::Hello {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: Capabilities {
+                power_actions: security.allow_power_actions,
+                input_injection: security.allow_input,
+                clipboard: security.allow_clipboard,
+                video_codec: "H264".to_string(),
+                width: desktop.width,
+                height: desktop.height,
+                display: desktop.output_index,
+                displays,
+                quality,
+            },
+        })
+        .await;
+
+    if let Some(shape) = shape {
+        emit_pointer_shape(runtime, &shape).await;
+    }
+    runtime.send_pointer(pointer).await;
+}
+
+/// Transmet une forme de curseur, si elle tient dans un message.
+async fn emit_pointer_shape(runtime: &SessionRuntime, shape: &PointerShape) {
+    if shape.width > MAX_SENT_POINTER_SIDE || shape.height > MAX_SENT_POINTER_SIDE {
+        tracing::debug!(
+            width = shape.width,
+            height = shape.height,
+            "curseur trop grand pour être transmis, forme précédente conservée"
+        );
+        return;
+    }
+    runtime
+        .emit(ControlEvent::PointerShape {
+            width: shape.width as u16,
+            height: shape.height as u16,
+            hot_x: shape.hot_x as u16,
+            hot_y: shape.hot_y as u16,
+            rgba: data_encoding::BASE64.encode(&shape.rgba),
+        })
+        .await;
+}
+
+/// Relaie vers le client ce que le thread de capture publie hors vidéo.
+///
+/// La tâche vit aussi longtemps que le pipeline dont elle écoute les
+/// publications, et s'arrête avec lui.
+fn spawn_feedback_forwarder(
+    runtime: Arc<SessionRuntime>,
+    mut feedback: PipelineFeedback,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = feedback.pointer.changed() => {
+                    if changed.is_err() { break }
+                    let pointer = *feedback.pointer.borrow_and_update();
+                    runtime.send_pointer(pointer).await;
+                    // Les positions arrivées entre-temps se résument à la
+                    // dernière : c'est la seule qui sera lue au réveil.
+                    tokio::time::sleep(POINTER_MIN_INTERVAL).await;
+                }
+                changed = feedback.shape.changed() => {
+                    if changed.is_err() { break }
+                    let shape = feedback.shape.borrow_and_update().clone();
+                    if let Some(shape) = shape {
+                        emit_pointer_shape(&runtime, &shape).await;
+                    }
+                }
+                changed = feedback.desktop.changed() => {
+                    if changed.is_err() { break }
+                    let desktop = *feedback.desktop.borrow_and_update();
+                    on_display_changed(&runtime, desktop).await;
+                }
+            }
+        }
+    })
+}
+
+/// La résolution de la sortie capturée a changé en cours de session.
+async fn on_display_changed(runtime: &SessionRuntime, desktop: DesktopInfo) {
+    apply_geometry(runtime, desktop);
+
+    // Le palier choisi vaut pour une surface : la nouvelle a un autre plafond.
+    let preset = *runtime.preset.lock();
+    let ceiling = runtime.dispatcher.lock().bitrate_for(preset);
+    let bitrate = runtime.bitrate.lock().set_ceiling(ceiling);
+    if let Some(pipeline) = runtime.pipeline.lock().as_ref() {
+        pipeline.set_bitrate(bitrate);
+    }
+
+    tracing::info!(
+        width = desktop.width,
+        height = desktop.height,
+        "géométrie du bureau changée"
+    );
+    runtime
+        .emit(ControlEvent::DisplayChanged {
+            index: desktop.output_index,
+            width: desktop.width,
+            height: desktop.height,
+        })
+        .await;
+}
+
 /// Libère tout : entrées maintenues, pipeline, transport, et verrouillage.
 async fn teardown(
-    session: &Arc<Session>,
     runtime: &Arc<SessionRuntime>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     session_id: &str,
+    reason: EndReason,
 ) {
     for task in tasks {
         task.abort();
@@ -603,18 +1133,21 @@ async fn teardown(
 
     // Le pipeline part ici, ce qui rend la VRAM, arrête le thread de capture et
     // ramène l'agent à sa consommation de repos.
-    runtime.pipeline.lock().take();
-    session.close().await;
+    stop_pipeline(runtime);
+    *runtime.control.lock() = None;
+    *runtime.input.lock() = None;
+    runtime.session.close().await;
 
     // La politique est lue sur le dispatcher : c'est lui qui détient les
     // garde-fous de la session, et une seule source évite qu'ils divergent.
-    if runtime.dispatcher.lock().lock_on_disconnect() {
+    if reason.triggers_killswitch() && runtime.dispatcher.lock().lock_on_disconnect() {
         match sidgate_input::system::lock_session() {
             Ok(()) => tracing::warn!(session = %session_id, "killswitch: session verrouillée"),
             Err(e) => tracing::error!(session = %session_id, error = %e, "killswitch en échec"),
         }
     }
-    tracing::info!(session = %session_id, "session close");
+    let rejected = runtime.rejected_inputs.load(Ordering::Relaxed);
+    tracing::info!(session = %session_id, ?reason, rejected_inputs = rejected, "session close");
 }
 
 /// Consomme un canal de données jusqu'à sa fermeture.
@@ -624,24 +1157,31 @@ fn spawn_channel(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let label = channel.label().await.unwrap_or_default();
-        tracing::info!(%label, "canal de données ouvert");
-
-        if label == CHANNEL_CONTROL {
-            *runtime.control.lock() = Some(Arc::clone(&channel));
-        } else if label != CHANNEL_INPUT {
+        let is_control = label == CHANNEL_CONTROL;
+        if !is_control && label != CHANNEL_INPUT {
             tracing::warn!(%label, "canal inattendu, ignoré");
             return;
         }
+        tracing::info!(%label, "canal de données ouvert");
+
+        if is_control {
+            *runtime.control.lock() = Some(Arc::clone(&channel));
+        } else {
+            *runtime.input.lock() = Some(Arc::clone(&channel));
+        }
+        // Le pipeline a pu démarrer avant ce canal : lui redire où il en est.
+        announce(&runtime).await;
 
         while let Some(event) = channel.poll().await {
             match event {
-                DataChannelEvent::OnMessage(message) => {
-                    if label == CHANNEL_INPUT {
-                        handle_input(&message.data, &runtime);
-                    } else {
-                        handle_control(&message.data, &runtime).await;
-                    }
-                }
+                DataChannelEvent::OnMessage(message) => match (is_control, message.is_string) {
+                    (true, true) => handle_control(&message.data, &runtime).await,
+                    // Appuis, relâchements et texte : fiables et ordonnés,
+                    // donc sans numéro de séquence à vérifier.
+                    (true, false) => handle_input(&message.data, &runtime, Delivery::Ordered),
+                    (false, false) => handle_input(&message.data, &runtime, Delivery::Lossy),
+                    (false, true) => {}
+                },
                 DataChannelEvent::OnClose | DataChannelEvent::OnError => break,
                 _ => {}
             }
@@ -650,8 +1190,17 @@ fn spawn_channel(
     })
 }
 
+/// Garanties du canal par lequel une trame d'entrées est arrivée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Canal fiable et ordonné.
+    Ordered,
+    /// Canal sans ordre ni retransmission.
+    Lossy,
+}
+
 /// Décode et applique une trame d'entrées.
-fn handle_input(payload: &BytesMut, runtime: &Arc<SessionRuntime>) {
+fn handle_input(payload: &BytesMut, runtime: &SessionRuntime, delivery: Delivery) {
     if !runtime.dispatcher.lock().input_allowed() {
         runtime.rejected_inputs.fetch_add(1, Ordering::Relaxed);
         return;
@@ -667,8 +1216,8 @@ fn handle_input(payload: &BytesMut, runtime: &Arc<SessionRuntime>) {
     };
 
     // Canal non ordonné : une trame plus ancienne que la dernière appliquée
-    // rejouerait des appuis dans le désordre.
-    if !runtime.seq.lock().accept(frame.seq) {
+    // ramènerait le pointeur en arrière.
+    if delivery == Delivery::Lossy && !runtime.seq.lock().accept(frame.seq) {
         return;
     }
 
@@ -696,24 +1245,33 @@ async fn handle_control(payload: &BytesMut, runtime: &Arc<SessionRuntime>) {
         }
     };
 
-    let name = command.name().to_string();
+    let name = command.name();
     let decision = runtime.dispatcher.lock().dispatch(command);
-    match decision {
+    let outcome = match decision {
         Ok(effect) => {
-            let outcome = apply(effect, runtime).await;
-            let event = match outcome {
-                Ok(()) => ControlEvent::CommandAccepted { command: name },
-                Err(reason) => ControlEvent::CommandRejected {
-                    command: name,
-                    reason,
-                },
-            };
-            runtime.emit(event).await;
+            if let ControlCommand::SetQuality { preset } = command {
+                *runtime.preset.lock() = preset;
+            }
+            apply(effect, runtime).await
+        }
+        Err(reason) => Err(reason),
+    };
+
+    match outcome {
+        // Une réponse de sonde n'appelle pas d'accusé de réception : il
+        // doublerait le trafic du canal pour ne rien apprendre au client.
+        Ok(()) if matches!(command, ControlCommand::Pong { .. }) => {}
+        Ok(()) => {
+            runtime
+                .emit(ControlEvent::CommandAccepted {
+                    command: name.to_string(),
+                })
+                .await;
         }
         Err(reason) => {
             runtime
                 .emit(ControlEvent::CommandRejected {
-                    command: name,
+                    command: name.to_string(),
                     reason,
                 })
                 .await;
@@ -727,26 +1285,32 @@ async fn apply(effect: Effect, runtime: &Arc<SessionRuntime>) -> Result<(), Reje
         Effect::Keyframe => {
             with_pipeline(runtime, |p| p.request_keyframe())?;
         }
-        Effect::Bitrate(bitrate) => {
+        Effect::Bitrate(ceiling) => {
+            let bitrate = runtime.bitrate.lock().set_ceiling(ceiling);
             with_pipeline(runtime, |p| p.set_bitrate(bitrate))?;
         }
-        Effect::CursorMode(mode) => {
-            runtime
-                .cursor_absolute
-                .store(mode == CursorMode::Absolute, Ordering::Relaxed);
-        }
         Effect::SendStats => {
-            let snapshot = runtime
-                .pipeline
-                .lock()
-                .as_ref()
-                .map(|p| p.stats().snapshot())
-                .unwrap_or_default();
-            runtime
-                .emit(ControlEvent::Stats(stats_from(&snapshot, STATS_INTERVAL)))
-                .await;
+            let stats = (*runtime.last_stats.lock()).ok_or(RejectReason::WrongState)?;
+            runtime.emit(ControlEvent::Stats(stats)).await;
         }
-        Effect::Pong(_) => {}
+        Effect::Pong(seq) => runtime.probe.lock().complete(seq, Instant::now()),
+        Effect::SelectDisplay(index) => select_display(runtime, index).await?,
+        Effect::SendClipboard => {
+            let read = tokio::task::spawn_blocking(|| {
+                sidgate_input::clipboard::read_text(MAX_CLIPBOARD_BYTES)
+            })
+            .await;
+            match read {
+                Ok(Ok((text, truncated))) => {
+                    runtime.emit(clipboard_event(text, truncated)).await;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "presse-papiers illisible");
+                    return Err(RejectReason::Failed);
+                }
+                Err(_) => return Err(RejectReason::Failed),
+            }
+        }
         Effect::Lock => sidgate_input::system::lock_session().map_err(|_| RejectReason::Failed)?,
         Effect::Sleep => sidgate_input::system::sleep().map_err(|_| RejectReason::Failed)?,
         Effect::Reboot => sidgate_input::system::reboot().map_err(|_| RejectReason::Failed)?,
@@ -755,7 +1319,64 @@ async fn apply(effect: Effect, runtime: &Arc<SessionRuntime>) -> Result<(), Reje
     Ok(())
 }
 
-fn with_pipeline<F>(runtime: &Arc<SessionRuntime>, action: F) -> Result<(), RejectReason>
+/// Bascule la capture sur une autre sortie vidéo.
+///
+/// Si la nouvelle sortie ne s'ouvre pas — écran débranché entre l'annonce et
+/// la demande — la capture revient à la précédente plutôt que de laisser le
+/// client devant une image figée.
+async fn select_display(runtime: &Arc<SessionRuntime>, index: u32) -> Result<(), RejectReason> {
+    let previous = runtime.output.swap(index, Ordering::Relaxed);
+    if previous == index && runtime.pipeline.lock().is_some() {
+        return Ok(());
+    }
+
+    // Les touches tenues appartiennent à l'écran que l'on quitte.
+    if let Err(e) = runtime.sink.lock().release_all() {
+        tracing::debug!(error = %e, "relâchement des entrées");
+    }
+    stop_pipeline(runtime);
+
+    match try_start_pipeline(runtime).await {
+        Ok(()) => Ok(()),
+        Err(e) if is_desktop_unavailable(&e) => {
+            // La session hôte est verrouillée : la reprise de capture ouvrira
+            // la sortie demandée dès que le bureau reviendra.
+            tracing::warn!(output = index, "écran sélectionné, capture différée");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(output = index, error = %e, "écran inaccessible, retour au précédent");
+            runtime.output.store(previous, Ordering::Relaxed);
+            if let Err(e) = try_start_pipeline(runtime).await {
+                tracing::error!(error = %e, "reprise de la capture impossible");
+            }
+            Err(RejectReason::Failed)
+        }
+    }
+}
+
+/// Construit l'événement de presse-papiers, réduit s'il le faut à la taille
+/// d'un message.
+///
+/// La borne porte sur le message *sérialisé* : un texte fait de caractères de
+/// contrôle sextuple à l'échappement JSON, et c'est le message qui doit passer.
+fn clipboard_event(mut text: String, mut truncated: bool) -> ControlEvent {
+    loop {
+        let event = ControlEvent::Clipboard {
+            text: text.clone(),
+            truncated,
+        };
+        let size = serde_json::to_string(&event).map_or(0, |json| json.len());
+        if size <= MAX_CONTROL_MESSAGE || text.is_empty() {
+            return event;
+        }
+        let half = text.len() / 2;
+        text = sidgate_input::truncate_utf8(text, half).0;
+        truncated = true;
+    }
+}
+
+fn with_pipeline<F>(runtime: &SessionRuntime, action: F) -> Result<(), RejectReason>
 where
     F: FnOnce(&Pipeline),
 {
@@ -768,12 +1389,14 @@ where
     }
 }
 
-/// Émet la télémétrie à intervalle régulier.
+/// Émet la télémétrie à intervalle régulier, tant que son pipeline tourne.
 fn spawn_stats_reporter(
     runtime: Arc<SessionRuntime>,
-    stats: Arc<crate::pipeline::PipelineStats>,
+    stats: Arc<PipelineStats>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut meter = ProcessMeter::new();
+        meter.sample();
         let mut previous = stats.snapshot();
         let mut last = Instant::now();
         let mut ticker = tokio::time::interval(STATS_INTERVAL);
@@ -781,7 +1404,7 @@ fn spawn_stats_reporter(
 
         loop {
             ticker.tick().await;
-            if runtime.pipeline.lock().is_none() {
+            if !runtime.owns(&stats) {
                 break;
             }
             let current = stats.snapshot();
@@ -790,14 +1413,28 @@ fn spawn_stats_reporter(
             previous = current;
             last = Instant::now();
 
-            runtime
-                .emit(ControlEvent::Stats(stats_from(&delta, elapsed)))
-                .await;
+            // La sonde précède la télémétrie : la réponse du client arrive
+            // avant le relevé suivant, qui l'annonce.
+            let (seq, rtt_ms) = {
+                let mut probe = runtime.probe.lock();
+                let rtt_ms = probe.rtt_ms;
+                (probe.begin(Instant::now()), rtt_ms)
+            };
+            runtime.emit(ControlEvent::Ping { seq }).await;
+
+            let report = stats_from(&delta, elapsed, meter.sample(), rtt_ms);
+            *runtime.last_stats.lock() = Some(report);
+            runtime.emit(ControlEvent::Stats(report)).await;
         }
     })
 }
 
-fn stats_from(delta: &StatsSnapshot, elapsed: Duration) -> Stats {
+fn stats_from(
+    delta: &StatsSnapshot,
+    elapsed: Duration,
+    process: ProcessSample,
+    rtt_ms: Option<f32>,
+) -> Stats {
     Stats {
         frames_captured: delta.captured,
         frames_encoded: delta.encoded,
@@ -807,8 +1444,9 @@ fn stats_from(delta: &StatsSnapshot, elapsed: Duration) -> Stats {
         bitrate_bps: delta.bitrate_bps(elapsed),
         fps: delta.fps(elapsed),
         encode_ms: delta.encode_ms(),
-        cpu_percent: 0.0,
-        rss_mb: 0.0,
+        cpu_percent: process.cpu_percent,
+        rss_mb: process.rss_mb,
+        rtt_ms,
     }
 }
 
@@ -835,11 +1473,35 @@ mod tests {
             bytes: 2_000_000,
             encode_us: 120_000,
         };
-        let stats = stats_from(&delta, Duration::from_secs(2));
+        let stats = stats_from(
+            &delta,
+            Duration::from_secs(2),
+            ProcessSample {
+                cpu_percent: Some(1.5),
+                rss_mb: Some(140.0),
+            },
+            Some(12.0),
+        );
         assert_eq!(stats.fps, 59.0);
         assert_eq!(stats.bitrate_bps, 8_000_000);
         assert_eq!(stats.frames_dropped, 2);
         assert!((stats.encode_ms - 1.0).abs() < 0.001);
+        assert_eq!(stats.cpu_percent, Some(1.5));
+        assert_eq!(stats.rss_mb, Some(140.0));
+        assert_eq!(stats.rtt_ms, Some(12.0));
+    }
+
+    #[test]
+    fn what_was_not_measured_is_reported_absent() {
+        let stats = stats_from(
+            &StatsSnapshot::default(),
+            Duration::from_secs(2),
+            ProcessSample::default(),
+            None,
+        );
+        assert_eq!(stats.cpu_percent, None);
+        assert_eq!(stats.rss_mb, None);
+        assert_eq!(stats.rtt_ms, None);
     }
 
     #[test]
@@ -849,5 +1511,147 @@ mod tests {
         assert_eq!(a.len(), NONCE_LEN);
         assert_ne!(a, b);
         assert_ne!(a, [0u8; NONCE_LEN]);
+    }
+
+    #[test]
+    fn mdns_candidates_are_recognised() {
+        assert!(is_mdns_candidate(
+            "candidate:1 1 udp 2113937151 56a5d85d-7c01-4f1b-8de2-9deb74a60dcb.local 54321 typ host"
+        ));
+        assert!(is_mdns_candidate(
+            "candidate:1 1 UDP 1 ABCD.LOCAL 1 typ host"
+        ));
+        assert!(!is_mdns_candidate(
+            "candidate:1 1 udp 2113937151 100.64.0.7 54321 typ host generation 0"
+        ));
+        assert!(!is_mdns_candidate(
+            "candidate:1 1 udp 1 fd7a:115c:a1e0::7 1 typ host"
+        ));
+        // Trop courte pour porter une adresse : ce n'est pas à ce filtre de
+        // la refuser, la pile ICE s'en charge.
+        assert!(!is_mdns_candidate("candidate:1 1 udp"));
+        assert!(!is_mdns_candidate(""));
+    }
+
+    #[test]
+    fn only_a_takeover_spares_the_killswitch() {
+        for reason in [
+            EndReason::ClientLeft,
+            EndReason::SignalingClosed,
+            EndReason::TransportLost,
+            EndReason::Revoked,
+            EndReason::Failed,
+        ] {
+            assert!(
+                reason.triggers_killswitch(),
+                "{reason:?} doit verrouiller le poste"
+            );
+        }
+        assert!(!EndReason::Replaced.triggers_killswitch());
+    }
+
+    #[test]
+    fn a_probe_measures_the_round_trip() {
+        let start = Instant::now();
+        let mut probe = Probe::default();
+        let seq = probe.begin(start);
+        assert_eq!(probe.rtt_ms, None, "rien n'est mesuré avant la réponse");
+
+        probe.complete(seq, start + Duration::from_millis(24));
+        let rtt = probe.rtt_ms.unwrap();
+        assert!((rtt - 24.0).abs() < 0.01, "{rtt}");
+    }
+
+    #[test]
+    fn an_answer_to_another_probe_is_ignored() {
+        let start = Instant::now();
+        let mut probe = Probe::default();
+        let first = probe.begin(start);
+        let second = probe.begin(start + Duration::from_secs(2));
+        assert_ne!(first, second);
+
+        probe.complete(first, start + Duration::from_secs(3));
+        assert_eq!(
+            probe.rtt_ms, None,
+            "la réponse tardive ne vaut pas pour la sonde en cours"
+        );
+        probe.complete(99, start + Duration::from_secs(3));
+        assert_eq!(probe.rtt_ms, None);
+    }
+
+    #[test]
+    fn an_unanswered_probe_expires_the_last_measure() {
+        let start = Instant::now();
+        let mut probe = Probe::default();
+        let seq = probe.begin(start);
+        probe.complete(seq, start + Duration::from_millis(10));
+        assert!(probe.rtt_ms.is_some());
+
+        // Deux sondes de suite sans réponse entre les deux.
+        probe.begin(start + Duration::from_secs(2));
+        assert!(
+            probe.rtt_ms.is_some(),
+            "la mesure reste valable tant qu'une sonde est attendue"
+        );
+        probe.begin(start + Duration::from_secs(4));
+        assert_eq!(
+            probe.rtt_ms, None,
+            "une valeur périmée ne reste pas affichée"
+        );
+    }
+
+    fn clipboard_size(event: &ControlEvent) -> usize {
+        serde_json::to_string(event).unwrap().len()
+    }
+
+    #[test]
+    fn a_short_clipboard_passes_untouched() {
+        let event = clipboard_event("bonjour".into(), false);
+        assert_eq!(
+            event,
+            ControlEvent::Clipboard {
+                text: "bonjour".into(),
+                truncated: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_clipboard_that_swells_when_escaped_is_cut_to_fit() {
+        // 32 Ko de caractères de contrôle : six fois plus une fois échappés.
+        let text = "\u{1}".repeat(MAX_CLIPBOARD_BYTES);
+        let event = clipboard_event(text, false);
+        assert!(clipboard_size(&event) <= MAX_CONTROL_MESSAGE);
+        let ControlEvent::Clipboard { text, truncated } = event else {
+            panic!("événement inattendu");
+        };
+        assert!(truncated);
+        assert!(!text.is_empty(), "couper n'est pas vider");
+    }
+
+    #[test]
+    fn a_clipboard_at_the_read_limit_fits_in_one_message() {
+        let event = clipboard_event("é".repeat(MAX_CLIPBOARD_BYTES / 2), true);
+        assert!(clipboard_size(&event) <= MAX_CONTROL_MESSAGE);
+        assert!(matches!(
+            event,
+            ControlEvent::Clipboard {
+                truncated: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_largest_pointer_shape_fits_in_one_message() {
+        let side = MAX_SENT_POINTER_SIDE as usize;
+        let event = ControlEvent::PointerShape {
+            width: side as u16,
+            height: side as u16,
+            hot_x: 0,
+            hot_y: 0,
+            rgba: data_encoding::BASE64.encode(&vec![0xFFu8; side * side * 4]),
+        };
+        assert!(serde_json::to_string(&event).unwrap().len() <= MAX_CONTROL_MESSAGE);
     }
 }

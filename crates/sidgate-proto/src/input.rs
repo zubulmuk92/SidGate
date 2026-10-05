@@ -9,6 +9,12 @@
 //! Le format est de taille fixe : une trame de huit mouvements souris tient en
 //! 46 octets, contre environ 500 en JSON.
 //!
+//! Le même codec circule sur les deux canaux. Les mouvements et le défilement
+//! empruntent `input-raw` : en perdre un est sans conséquence, le suivant
+//! corrige. Les appuis, les relâchements et le texte empruntent le canal fiable
+//! et ordonné, où aucune trame ne se perd : un relâchement égaré laisserait une
+//! touche enfoncée sur l'hôte, et un caractère égaré trouerait un mot de passe.
+//!
 //! ```text
 //! octet 0      version (= FRAME_VERSION)
 //! octets 1..5  numéro de séquence, u32 little-endian
@@ -31,6 +37,8 @@ const KIND_MOUSE_MOVE_ABS: u8 = 0x02;
 const KIND_MOUSE_BUTTON: u8 = 0x03;
 const KIND_MOUSE_SCROLL: u8 = 0x04;
 const KIND_KEY: u8 = 0x05;
+const KIND_TEXT: u8 = 0x06;
+const KIND_KEY_CHAR: u8 = 0x07;
 
 const FLAG_PRESSED: u8 = 0b0000_0001;
 const FLAG_EXTENDED: u8 = 0b0000_0010;
@@ -110,6 +118,33 @@ pub enum InputEvent {
         /// Préfixe `0xE0` : flèches, pavé numérique étendu, touches Windows.
         extended: bool,
     },
+    /// Saisie d'une unité de code UTF-16, hors de toute disposition clavier.
+    ///
+    /// C'est le chemin des claviers virtuels et des méthodes de saisie, qui
+    /// produisent du texte et non des touches : un « é » tapé sur un téléphone
+    /// n'a pas de scancode. L'unité est un entier borné, pas une chaîne : le
+    /// codec ne transporte toujours aucun champ de longueur libre. Un caractère
+    /// hors du plan de base voyage en deux événements, demi-codet haut puis bas.
+    Text {
+        /// Unité de code UTF-16.
+        unit: u16,
+    },
+    /// Appui ou relâchement de la touche qui *produit* un caractère donné.
+    ///
+    /// Un raccourci se désigne par sa lettre, pas par une position : « Ctrl+W »
+    /// veut la touche marquée W, qui n'est pas au même endroit sur un AZERTY et
+    /// sur un QWERTY. Seul l'hôte connaît sa disposition ; c'est donc lui qui
+    /// retrouve la touche, et le client n'envoie que le caractère.
+    ///
+    /// Sert aux raccourcis proposés à l'écran et aux claviers virtuels, qui
+    /// n'ont pas de position physique à transmettre. Un clavier matériel passe
+    /// toujours par [`InputEvent::Key`].
+    KeyChar {
+        /// Caractère gravé sur la touche, en unité de code UTF-16.
+        unit: u16,
+        /// `true` à l'appui, `false` au relâchement.
+        pressed: bool,
+    },
 }
 
 impl InputEvent {
@@ -118,8 +153,8 @@ impl InputEvent {
             Self::MouseMoveRelative { .. }
             | Self::MouseMoveAbsolute { .. }
             | Self::MouseScroll { .. } => 4,
-            Self::MouseButton { .. } => 2,
-            Self::Key { .. } => 3,
+            Self::MouseButton { .. } | Self::Text { .. } => 2,
+            Self::Key { .. } | Self::KeyChar { .. } => 3,
         }
     }
 
@@ -161,7 +196,30 @@ impl InputEvent {
                 }
                 out.push(flags);
             }
+            Self::Text { unit } => {
+                out.push(KIND_TEXT);
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+            Self::KeyChar { unit, pressed } => {
+                out.push(KIND_KEY_CHAR);
+                out.extend_from_slice(&unit.to_le_bytes());
+                out.push(if pressed { FLAG_PRESSED } else { 0 });
+            }
         }
+    }
+
+    /// L'événement tolère-t-il d'être perdu ?
+    ///
+    /// Vrai pour ce qu'un événement ultérieur rattrape de lui-même. Un client
+    /// envoie ceux-là sur le canal non fiable et tous les autres sur le canal
+    /// ordonné.
+    pub fn is_lossy(&self) -> bool {
+        matches!(
+            self,
+            Self::MouseMoveRelative { .. }
+                | Self::MouseMoveAbsolute { .. }
+                | Self::MouseScroll { .. }
+        )
     }
 }
 
@@ -311,6 +369,20 @@ fn decode_event(buf: &[u8]) -> Result<(InputEvent, usize), ProtoError> {
                 4,
             )
         }
+        KIND_TEXT => {
+            need(3)?;
+            (InputEvent::Text { unit: u16_at(1) }, 3)
+        }
+        KIND_KEY_CHAR => {
+            need(4)?;
+            (
+                InputEvent::KeyChar {
+                    unit: u16_at(1),
+                    pressed: buf[3] & FLAG_PRESSED != 0,
+                },
+                4,
+            )
+        }
         other => return Err(ProtoError::UnknownEvent(other)),
     };
     Ok(event)
@@ -383,6 +455,11 @@ mod tests {
                     pressed: false,
                     extended: true,
                 },
+                InputEvent::Text { unit: 0x00E9 },
+                InputEvent::KeyChar {
+                    unit: u16::from(b'w'),
+                    pressed: true,
+                },
             ],
         }
     }
@@ -395,8 +472,8 @@ mod tests {
 
     #[test]
     fn frame_stays_compact() {
-        // 6 octets d'en-tête + 5 + 5 + 3 + 5 + 4
-        assert_eq!(sample_frame().encode().len(), 28);
+        // 6 octets d'en-tête + 5 + 5 + 3 + 5 + 4 + 3 + 4
+        assert_eq!(sample_frame().encode().len(), 35);
     }
 
     #[test]
@@ -422,7 +499,10 @@ mod tests {
     #[test]
     fn rejects_unknown_event_kind() {
         let buf = [FRAME_VERSION, 0, 0, 0, 0, 1, 0x7F, 0, 0, 0, 0];
-        assert_eq!(InputFrame::decode(&buf), Err(ProtoError::UnknownEvent(0x7F)));
+        assert_eq!(
+            InputFrame::decode(&buf),
+            Err(ProtoError::UnknownEvent(0x7F))
+        );
     }
 
     #[test]
@@ -446,7 +526,10 @@ mod tests {
     #[test]
     fn rejects_declared_count_above_hard_limit() {
         let buf = [FRAME_VERSION, 0, 0, 0, 0, 200];
-        assert_eq!(InputFrame::decode(&buf), Err(ProtoError::TooManyEvents(200)));
+        assert_eq!(
+            InputFrame::decode(&buf),
+            Err(ProtoError::TooManyEvents(200))
+        );
     }
 
     #[test]
@@ -466,6 +549,41 @@ mod tests {
             InputFrame::decode(&[FRAME_VERSION, 0, 0]),
             Err(ProtoError::Truncated { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_truncated_text() {
+        let buf = [FRAME_VERSION, 0, 0, 0, 0, 1, KIND_TEXT, 0xE9];
+        assert!(matches!(
+            InputFrame::decode(&buf),
+            Err(ProtoError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn only_self_correcting_events_are_lossy() {
+        assert!(InputEvent::MouseMoveRelative { dx: 1, dy: 1 }.is_lossy());
+        assert!(InputEvent::MouseMoveAbsolute { x: 1, y: 1 }.is_lossy());
+        assert!(InputEvent::MouseScroll { dx: 0, dy: 120 }.is_lossy());
+        // Un relâchement perdu laisse une touche enfoncée ; un caractère perdu
+        // troue le texte. Ni l'un ni l'autre ne se rattrape tout seul.
+        assert!(!InputEvent::Text { unit: 0x41 }.is_lossy());
+        assert!(!InputEvent::KeyChar {
+            unit: 0x41,
+            pressed: false
+        }
+        .is_lossy());
+        assert!(!InputEvent::Key {
+            scancode: 0x1E,
+            pressed: false,
+            extended: false
+        }
+        .is_lossy());
+        assert!(!InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: false
+        }
+        .is_lossy());
     }
 
     #[test]

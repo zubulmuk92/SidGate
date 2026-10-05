@@ -60,12 +60,56 @@ export function toScancode(code) {
   return null;
 }
 
-/** Raccourcis proposés par le panneau d'actions rapides. */
+/**
+ * Repli pour les claviers virtuels, qui renseignent `key` mais laissent `code`
+ * vide : seules les touches sans caractère y figurent, les caractères passant
+ * par la saisie de texte.
+ */
+const BY_KEY = {
+  Enter: 'Enter', Backspace: 'Backspace', Tab: 'Tab', Escape: 'Escape', Delete: 'Delete',
+  ArrowUp: 'ArrowUp', ArrowDown: 'ArrowDown', ArrowLeft: 'ArrowLeft', ArrowRight: 'ArrowRight',
+  Home: 'Home', End: 'End', PageUp: 'PageUp', PageDown: 'PageDown',
+};
+
+/**
+ * Traduit un événement clavier, en se rabattant sur `key` quand `code` manque.
+ * @param {{code: string, key: string}} event
+ * @returns {{scancode: number, extended: boolean} | null}
+ */
+export function scancodeOf(event) {
+  return toScancode(event.code) ?? toScancode(BY_KEY[event.key] ?? '');
+}
+
+/**
+ * Raccourcis proposés par le panneau d'actions rapides.
+ *
+ * Une touche s'écrit de deux façons. Par position — `code` — pour celles qui
+ * sont au même endroit sur tous les claviers : Échap, Tab, les modificatrices.
+ * Par caractère — `char` — pour les lettres : « Ctrl+C » désigne la touche
+ * gravée C, que seul l'hôte sait situer sur sa propre disposition. L'écrire par
+ * position enverrait Ctrl+Q à un hôte AZERTY à la place de Ctrl+A.
+ *
+ * Ctrl+Alt+Suppr n'y figure pas : Windows réserve cette séquence au clavier
+ * physique et ignore celle qu'un programme injecte.
+ */
 export const SHORTCUTS = [
-  { label: 'Ctrl+Alt+Suppr', keys: ['ControlLeft', 'AltLeft', 'Delete'] },
-  { label: 'Alt+Tab', keys: ['AltLeft', 'Tab'] },
-  { label: 'Win', keys: ['MetaLeft'] },
-  { label: 'Ctrl+W', keys: ['ControlLeft', 'KeyW'] },
-  { label: 'Échap', keys: ['Escape'] },
-  { label: 'Impr. écran', keys: ['PrintScreen'] },
+  { label: 'Échap', keys: [{ code: 'Escape' }] },
+  { label: 'Tab', keys: [{ code: 'Tab' }] },
+  { label: 'Alt+Tab', keys: [{ code: 'AltLeft' }, { code: 'Tab' }] },
+  { label: 'Win', keys: [{ code: 'MetaLeft' }] },
+  { label: 'Gest. tâches', keys: [{ code: 'ControlLeft' }, { code: 'ShiftLeft' }, { code: 'Escape' }] },
+  { label: 'Ctrl+C', keys: [{ code: 'ControlLeft' }, { char: 'c' }] },
+  { label: 'Ctrl+V', keys: [{ code: 'ControlLeft' }, { char: 'v' }] },
+  { label: 'Ctrl+Z', keys: [{ code: 'ControlLeft' }, { char: 'z' }] },
+  { label: 'Impr. écran', keys: [{ code: 'PrintScreen' }] },
+];
+
+/**
+ * Modificatrices à bascule, pour les écrans tactiles : un appui les enfonce,
+ * la frappe suivante les relâche.
+ */
+export const MODIFIERS = [
+  { label: 'Ctrl', code: 'ControlLeft' },
+  { label: 'Alt', code: 'AltLeft' },
+  { label: 'Maj', code: 'ShiftLeft' },
 ];

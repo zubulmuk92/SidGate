@@ -56,9 +56,15 @@ pub fn agent_transcript(server_nonce: &[u8], client_nonce: &[u8], client_key: &[
 
 /// Chaque champ est préfixé de sa longueur : sans cela, un découpage différent
 /// des mêmes octets produirait la même transcription.
-fn transcript(domain: &[u8], server_nonce: &[u8], client_nonce: &[u8], client_key: &[u8]) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(domain.len() + server_nonce.len() + client_nonce.len() + client_key.len() + 16);
+fn transcript(
+    domain: &[u8],
+    server_nonce: &[u8],
+    client_nonce: &[u8],
+    client_key: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        domain.len() + server_nonce.len() + client_nonce.len() + client_key.len() + 16,
+    );
     for part in [domain, server_nonce, client_nonce, client_key] {
         out.extend_from_slice(&(part.len() as u32).to_le_bytes());
         out.extend_from_slice(part);
@@ -170,6 +176,24 @@ pub enum ServerMessage {
         /// Message court, sans détail interne.
         message: String,
     },
+    /// L'agent met fin à la session, et dit pourquoi.
+    Closed {
+        /// Motif de la fermeture.
+        reason: CloseReason,
+    },
+}
+
+/// Motifs de fermeture d'une session par l'agent.
+///
+/// Le client s'en sert pour décider s'il doit retenter : se reconnecter après
+/// avoir été remplacé ferait se disputer la session par deux appareils.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    /// Un autre appareil appairé vient d'ouvrir une session.
+    Replaced,
+    /// Trop de connexions attendent déjà de s'authentifier.
+    Busy,
 }
 
 /// Motifs de refus d'authentification.
@@ -205,7 +229,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 /// Décode une chaîne hexadécimale. Refuse toute longueur impaire ou tout
 /// caractère hors `[0-9a-fA-F]`.
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if s.len() % 2 != 0 {
         return None;
     }
     let bytes = s.as_bytes();

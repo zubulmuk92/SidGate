@@ -3,21 +3,23 @@
 //!
 //! Voir le README pour l'architecture d'ensemble et la matrice de sécurité.
 
+mod acl;
+mod adapt;
 mod config;
 mod control;
 mod identity;
 mod pipeline;
+mod process;
+mod rtcp_forward;
 mod service;
 mod session;
 mod signaling;
 mod tls;
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use parking_lot::Mutex;
 use tokio::io::AsyncBufReadExt;
 
 use crate::config::Config;
@@ -51,8 +53,17 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Ouvre un appairage sur l'agent en cours d'exécution et affiche le code.
+    ///
+    /// À utiliser quand l'agent tourne en service, sans console où taper « p ».
+    Pair,
     /// Affiche l'identité de l'agent et l'emplacement de ses données.
     Info,
+    /// Ferme le répertoire de données aux autres comptes de la machine.
+    ///
+    /// Fait d'office à la création du répertoire ; utile pour une installation
+    /// antérieure, dont le répertoire a hérité de droits trop larges.
+    Protect,
     /// Liste les clients appairés.
     Clients,
     /// Révoque un client par sa clé publique.
@@ -85,10 +96,17 @@ enum ServiceAction {
 }
 
 fn main() -> anyhow::Result<()> {
-    init_tracing();
-    install_crypto_provider()?;
-
     let cli = Cli::parse();
+
+    // Le travailleur lancé par le service n'a ni console ni sortie d'erreur :
+    // son journal va dans un fichier, sans quoi une panne en service ne
+    // laisserait aucune trace à lire.
+    let log_file = matches!(cli.command, Some(Command::Worker))
+        .then(|| open_log_file(&config::data_dir()))
+        .flatten();
+    init_tracing(log_file);
+    install_crypto_provider()?;
+    declare_dpi_awareness();
 
     // Les commandes de service ne touchent pas a la configuration de l'agent :
     // la charger ici ecrirait un fichier par defaut au premier « status », ce
@@ -111,7 +129,9 @@ fn main() -> anyhow::Result<()> {
         Command::Run { pair } => run(dir, config, pair, Console::Interactive),
         Command::Worker => run(dir, config, false, Console::None),
         Command::Service { .. } => unreachable!("traite plus haut"),
+        Command::Pair => pair(dir, config),
         Command::Info => info(dir, config),
+        Command::Protect => protect(dir),
         Command::Clients => clients(dir, config),
         Command::Revoke { key } => revoke(dir, config, &key),
     }
@@ -140,12 +160,16 @@ fn run(
     let identity = Identity::load_or_create(&dir, config.security.auth_attempts_per_minute)?;
     let tls = tls::load_or_create(&dir, config.network.bind, &[])?;
 
+    if acl::exposure(&dir) == acl::Exposure::Shared {
+        tracing::warn!(
+            path = %dir.display(),
+            "le répertoire de données est accessible aux autres comptes de cette machine ; \
+             « sidgate protect » le ferme"
+        );
+    }
+
     let no_clients = identity.clients().is_empty();
-    let state = Arc::new(AppState {
-        identity: Mutex::new(identity),
-        config: config.clone(),
-        busy: AtomicBool::new(false),
-    });
+    let state = Arc::new(AppState::new(identity, config));
 
     if console == Console::Interactive {
         print_banner(&state, &tls, &dir);
@@ -156,12 +180,9 @@ fn run(
             open_pairing(&state);
         }
     } else if no_clients {
-        // Sous service, personne ne peut lire un code : l'appairage se fait en
-        // lançant l'agent à la main une première fois.
-        tracing::warn!(
-            "aucun client appairé ; lancez « sidgate run » depuis une session \
-             interactive pour appairer un appareil"
-        );
+        // Sous service, personne ne peut lire un code ici : il s'obtient
+        // depuis une invite, qui le dépose dans le répertoire de données.
+        tracing::warn!("aucun client appairé ; lancez « sidgate pair » pour appairer un appareil");
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -209,16 +230,104 @@ async fn console_loop(state: Arc<AppState>) {
 fn open_pairing(state: &Arc<AppState>) {
     let ttl = Duration::from_secs(state.config.security.pairing_window_secs);
     match state.identity.lock().open_pairing(ttl) {
-        Ok(code) => {
-            println!();
-            println!("  ┌──────────────────────────────────┐");
-            println!("  │  code d'appairage : {code}     │");
-            println!("  └──────────────────────────────────┘");
-            println!("  valable {} secondes, un seul usage", ttl.as_secs());
-            println!();
-        }
+        Ok(code) => print_pairing_code(&code, ttl),
         Err(e) => eprintln!("appairage impossible: {e}"),
     }
+}
+
+fn print_pairing_code(code: &str, ttl: Duration) {
+    println!();
+    println!("  ┌──────────────────────────────────┐");
+    println!("  │  code d'appairage : {code}    │");
+    println!("  └──────────────────────────────────┘");
+    println!("  valable {} secondes, un seul usage", ttl.as_secs());
+    println!();
+}
+
+/// Ouvre un appairage sur l'agent en cours d'exécution, depuis une invite.
+///
+/// La demande est un fichier déposé dans le répertoire de données : l'agent la
+/// découvre à la prochaine connexion d'un client. Rien ne transite par le
+/// réseau, et pouvoir écrire dans ce répertoire est précisément ce qui prouve
+/// que la demande vient de la machine elle-même.
+fn pair(dir: std::path::PathBuf, config: Config) -> anyhow::Result<()> {
+    let known: Vec<String> =
+        Identity::load_or_create(&dir, config.security.auth_attempts_per_minute)?
+            .clients()
+            .iter()
+            .map(|client| client.key.clone())
+            .collect();
+
+    let address = std::net::SocketAddr::new(config.network.bind, config.network.port);
+    if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(400)).is_err() {
+        println!("  aucun agent n'écoute sur {address} : le code ne servira que s'il démarre");
+        println!("  avant son échéance ( sidgate service start, ou sidgate run ).");
+    }
+
+    let ttl = Duration::from_secs(config.security.pairing_window_secs);
+    let code = identity::write_pairing_ticket(&dir, ttl)?;
+    print_pairing_code(&code, ttl);
+    println!("  en attente de l'appareil… ( Ctrl+C pour annuler )");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let outcome = runtime.block_on(async {
+        tokio::select! {
+            outcome = wait_for_pairing(&dir, &config, &known, ttl) => outcome,
+            _ = tokio::signal::ctrl_c() => PairingOutcome::Cancelled,
+        }
+    });
+
+    // Quelle que soit l'issue, le code ne doit pas lui survivre.
+    identity::clear_pairing_ticket(&dir);
+    match outcome {
+        PairingOutcome::Paired(label) => println!("  appareil « {label} » appairé"),
+        PairingOutcome::Expired => println!("  code expiré sans avoir été utilisé"),
+        PairingOutcome::Cancelled => println!("  appairage annulé"),
+    }
+    Ok(())
+}
+
+enum PairingOutcome {
+    Paired(String),
+    Expired,
+    Cancelled,
+}
+
+/// Attend que la demande déposée soit consommée par l'agent, ou qu'elle expire.
+async fn wait_for_pairing(
+    dir: &std::path::Path,
+    config: &Config,
+    known: &[String],
+    ttl: Duration,
+) -> PairingOutcome {
+    let deadline = Instant::now() + ttl;
+    let newcomer = || {
+        Identity::load_or_create(dir, config.security.auth_attempts_per_minute)
+            .ok()?
+            .clients()
+            .iter()
+            .find(|client| !known.contains(&client.key))
+            .map(|client| client.label.clone())
+    };
+
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if !identity::pairing_ticket_pending(dir) {
+            // Consommée : l'agent a inscrit le client juste avant de l'effacer.
+            return newcomer().map_or(PairingOutcome::Expired, PairingOutcome::Paired);
+        }
+    }
+    newcomer().map_or(PairingOutcome::Expired, PairingOutcome::Paired)
+}
+
+/// Ferme le répertoire de données aux autres comptes de la machine.
+fn protect(dir: std::path::PathBuf) -> anyhow::Result<()> {
+    acl::restrict(&dir)?;
+    println!("répertoire fermé aux autres comptes : {}", dir.display());
+    println!("y accèdent désormais le système, les administrateurs et le compte courant.");
+    Ok(())
 }
 
 fn print_banner(state: &Arc<AppState>, tls: &tls::TlsMaterial, dir: &std::path::Path) {
@@ -227,7 +336,11 @@ fn print_banner(state: &Arc<AppState>, tls: &tls::TlsMaterial, dir: &std::path::
     println!("  données     : {}", dir.display());
     println!(
         "  écoute      : {}://{}:{}",
-        if state.config.network.tls { "https" } else { "http" },
+        if state.config.network.tls {
+            "https"
+        } else {
+            "http"
+        },
         state.config.network.bind,
         state.config.network.port
     );
@@ -235,7 +348,8 @@ fn print_banner(state: &Arc<AppState>, tls: &tls::TlsMaterial, dir: &std::path::
     println!("  certificat  : {}", tls.fingerprint);
     println!("  clients     : {}", identity.clients().len());
     println!();
-    println!("  tapez « p » puis Entrée pour ouvrir un appairage, « x » pour l'annuler");
+    println!("  tapez « p » puis Entrée pour ouvrir un appairage, « x » pour l'annuler,");
+    println!("  « c » pour lister les appareils autorisés");
     println!();
 }
 
@@ -243,21 +357,43 @@ fn info(dir: std::path::PathBuf, config: Config) -> anyhow::Result<()> {
     let identity = Identity::load_or_create(&dir, config.security.auth_attempts_per_minute)?;
     let tls = tls::load_or_create(&dir, config.network.bind, &[])?;
     println!("répertoire de données : {}", dir.display());
-    println!("configuration         : {}", dir.join(config::CONFIG_FILE).display());
+    println!(
+        "accès au répertoire   : {}",
+        match acl::exposure(&dir) {
+            acl::Exposure::Private => "réservé au système, aux administrateurs et à son compte",
+            acl::Exposure::Shared =>
+                "OUVERT aux autres comptes — fermez-le avec « sidgate protect »",
+            acl::Exposure::Unknown => "indéterminé",
+        }
+    );
+    println!(
+        "configuration         : {}",
+        dir.join(config::CONFIG_FILE).display()
+    );
     println!("clé publique          : {}", identity.public_key_hex());
     println!("empreinte identité    : {}", identity.fingerprint());
     println!("empreinte certificat  : {}", tls.fingerprint);
     println!(
-        "écoute                : https://{}:{}",
-        config.network.bind, config.network.port
+        "écoute                : {}://{}:{}",
+        if config.network.tls { "https" } else { "http" },
+        config.network.bind,
+        config.network.port
+    );
+    let yes_no = |value: bool| if value { "oui" } else { "non" };
+    let security = &config.security;
+    println!("clients appairés      : {}", identity.clients().len());
+    println!("souris et clavier     : {}", yes_no(security.allow_input));
+    println!(
+        "veille et extinction  : {}",
+        yes_no(security.allow_power_actions)
     );
     println!(
-        "actions alimentation  : {}",
-        if config.security.allow_power_actions {
-            "autorisées"
-        } else {
-            "refusées"
-        }
+        "lecture presse-papiers: {}",
+        yes_no(security.allow_clipboard)
+    );
+    println!(
+        "verrouillage à la fin : {}",
+        yes_no(security.lock_on_disconnect)
     );
     Ok(())
 }
@@ -272,7 +408,13 @@ fn clients(dir: std::path::PathBuf, config: Config) -> anyhow::Result<()> {
         println!("{}", client.label);
         println!("  clé       : {}", client.key);
         println!("  appairé   : {}", format_unix(client.paired_at));
-        println!("  vu le     : {}", client.last_seen.map(format_unix).unwrap_or_else(|| "jamais".into()));
+        println!(
+            "  vu le     : {}",
+            client
+                .last_seen
+                .map(format_unix)
+                .unwrap_or_else(|| "jamais".into())
+        );
     }
     Ok(())
 }
@@ -280,7 +422,7 @@ fn clients(dir: std::path::PathBuf, config: Config) -> anyhow::Result<()> {
 fn revoke(dir: std::path::PathBuf, config: Config, key: &str) -> anyhow::Result<()> {
     let mut identity = Identity::load_or_create(&dir, config.security.auth_attempts_per_minute)?;
     if identity.revoke(key)? {
-        println!("client révoqué");
+        println!("client révoqué ; une session en cours de ce client se ferme sous cinq secondes");
     } else {
         println!("aucun client avec cette clé");
     }
@@ -309,11 +451,75 @@ fn install_crypto_provider() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("fournisseur cryptographique déjà installé"))
 }
 
-fn init_tracing() {
+/// Déclare le processus conscient de la densité de chaque écran.
+///
+/// Sans cette déclaration, Windows lui présente une géométrie *virtualisée* :
+/// les coordonnées des écrans sont remises à l'échelle comme si tous avaient la
+/// densité du principal. La capture, elle, livre toujours des pixels réels. Sur
+/// un poste mêlant un écran à 100 % et un autre à 150 %, les deux repères ne
+/// coïncideraient plus et un clic distant tomberait à côté.
+fn declare_dpi_awareness() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        // SAFETY: appel sans pointeur, à faire avant toute fenêtre — l'agent
+        // n'en crée aucune.
+        let declared =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if let Err(e) = declared {
+            tracing::debug!(error = %e, "conscience de la densité d'écran non déclarée");
+        }
+    }
+}
+
+/// Nom du journal du travailleur, dans le répertoire de données.
+const LOG_FILE: &str = "sidgate.log";
+/// Taille au-delà de laquelle le journal est archivé au démarrage suivant.
+const LOG_ROTATE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Ouvre le journal du travailleur en ajout, après l'avoir archivé s'il a trop
+/// grossi.
+///
+/// Une seule archive est conservée : deux fichiers bornent l'espace occupé
+/// sans qu'il y ait de tâche de purge à faire tourner.
+fn open_log_file(dir: &std::path::Path) -> Option<std::fs::File> {
+    let _ = acl::create_private_dir(dir);
+    let path = dir.join(LOG_FILE);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_ROTATE_BYTES) {
+        let _ = std::fs::rename(&path, dir.join(format!("{LOG_FILE}.1")));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// Filtre de journalisation appliqué sans `SIDGATE_LOG`.
+///
+/// Trois modules de la pile WebRTC émettent un avertissement à chaque ouverture
+/// de session, sur des situations normales pour un agent qui répond sans
+/// connaître d'avance l'adresse du client. Ils sont ramenés au niveau erreur :
+/// un journal où chaque session laisse trois fausses alertes apprend à ne plus
+/// lire les vraies.
+const DEFAULT_LOG_FILTER: &str =
+    "warn,sidgate=info,rtc_ice::agent=error,rtc_sctp::endpoint=error,rtc_dtls::config=error";
+
+fn init_tracing(log_file: Option<std::fs::File>) {
     let filter = tracing_subscriber::EnvFilter::try_from_env("SIDGATE_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sidgate=info,warn"));
-    tracing_subscriber::fmt()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(true)
-        .init();
+        .with_target(true);
+    match log_file {
+        Some(file) => builder
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        // Sur la sortie d'erreur : la sortie standard reste celle des
+        // commandes, qu'un script peut lire sans y trouver de journal.
+        None => builder.with_writer(std::io::stderr).init(),
+    }
 }

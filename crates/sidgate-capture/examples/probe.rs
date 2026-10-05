@@ -19,7 +19,10 @@ fn main() {
     };
 
     let desktop = capturer.desktop();
-    println!("sortie {} : {}x{}", desktop.output_index, desktop.width, desktop.height);
+    println!(
+        "sortie {} : {}x{}",
+        desktop.output_index, desktop.width, desktop.height
+    );
 
     let (mut ready, mut idle, mut accumulated_total) = (0u64, 0u64, 0u64);
     let start = Instant::now();

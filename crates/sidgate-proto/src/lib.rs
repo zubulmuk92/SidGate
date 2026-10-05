@@ -4,7 +4,8 @@
 //! des messages qui circulent sur les deux DataChannels WebRTC et sur le canal
 //! de signalisation.
 //!
-//! - [`input`] : codec binaire compact, canal `input-raw` (non ordonné, non fiable)
+//! - [`input`] : codec binaire compact des entrées
+//! - [`pointer`] : position réelle du curseur, de l'agent vers le client
 //! - [`control`] : commandes typées, canal `control-secure` (fiable, ordonné)
 //! - [`signaling`] : handshake d'authentification mutuelle et échange SDP/ICE
 
@@ -12,16 +13,19 @@
 
 pub mod control;
 pub mod input;
+pub mod pointer;
 pub mod signaling;
 
-/// Identifiant du canal de données temps réel (souris, clavier, molette).
+/// Identifiant du canal de données temps réel, non ordonné et non fiable :
+/// mouvements et défilement à l'aller, position du pointeur au retour.
 pub const CHANNEL_INPUT: &str = "input-raw";
-/// Identifiant du canal de données fiable (commandes système, télémétrie).
+/// Identifiant du canal de données fiable et ordonné : commandes et télémétrie
+/// en texte, appuis, relâchements et saisie de texte en binaire.
 pub const CHANNEL_CONTROL: &str = "control-secure";
 
 /// Version du protocole applicatif. Un client annonçant une version différente
 /// est rejeté au handshake.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Erreurs de décodage des messages.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

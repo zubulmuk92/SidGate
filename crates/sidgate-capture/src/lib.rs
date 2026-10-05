@@ -21,9 +21,11 @@ use std::time::Duration;
 pub mod desktop;
 #[cfg(windows)]
 pub mod dxgi;
+pub mod pointer;
 
 #[cfg(windows)]
-pub use dxgi::DxgiCapturer as Capturer;
+pub use dxgi::{enumerate_outputs, DxgiCapturer as Capturer, PointerState};
+pub use pointer::PointerShape;
 
 /// Géométrie et format de la source capturée.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,39 @@ pub struct DesktopInfo {
     pub height: u32,
     /// Index de la sortie vidéo dupliquée.
     pub output_index: u32,
+    /// Abscisse du coin haut-gauche de la sortie dans le bureau virtuel.
+    pub left: i32,
+    /// Ordonnée du coin haut-gauche de la sortie dans le bureau virtuel.
+    pub top: i32,
+}
+
+/// Une sortie vidéo attachée au bureau.
+///
+/// Les coordonnées sont celles du bureau virtuel, qui réunit tous les écrans :
+/// l'écran principal y a son coin haut-gauche à l'origine, et un écran placé à
+/// sa gauche a une abscisse négative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputInfo {
+    /// Index global, à passer à l'ouverture du capteur.
+    pub index: u32,
+    /// Abscisse du coin haut-gauche.
+    pub left: i32,
+    /// Ordonnée du coin haut-gauche.
+    pub top: i32,
+    /// Largeur en pixels.
+    pub width: u32,
+    /// Hauteur en pixels.
+    pub height: u32,
+}
+
+impl OutputInfo {
+    /// Est-ce l'écran principal ?
+    ///
+    /// Windows place toujours l'origine du bureau virtuel sur son coin
+    /// haut-gauche : c'est la définition même de l'écran principal.
+    pub fn is_primary(&self) -> bool {
+        self.left == 0 && self.top == 0
+    }
 }
 
 /// Résultat d'un cycle d'acquisition.
@@ -90,4 +125,23 @@ pub trait FrameSource {
     /// bloquant côté pilote, sans attente active : c'est ce qui permet de tenir
     /// une charge CPU nulle sur un bureau immobile.
     fn acquire(&mut self, timeout: Duration) -> Result<FrameStatus, CaptureError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_primary_output_sits_at_the_origin() {
+        let output = |left, top| OutputInfo {
+            index: 0,
+            left,
+            top,
+            width: 1920,
+            height: 1080,
+        };
+        assert!(output(0, 0).is_primary());
+        assert!(!output(-1920, 0).is_primary());
+        assert!(!output(0, 1080).is_primary());
+    }
 }

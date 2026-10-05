@@ -90,15 +90,21 @@ mod tests {
     #[test]
     fn bitrate_scales_with_pixel_count() {
         assert_eq!(
-            config(1920, 1080).scale_bitrate_to_resolution(8_000_000).bitrate,
+            config(1920, 1080)
+                .scale_bitrate_to_resolution(8_000_000)
+                .bitrate,
             8_000_000
         );
         assert_eq!(
-            config(3840, 2160).scale_bitrate_to_resolution(8_000_000).bitrate,
+            config(3840, 2160)
+                .scale_bitrate_to_resolution(8_000_000)
+                .bitrate,
             32_000_000
         );
         assert_eq!(
-            config(1280, 720).scale_bitrate_to_resolution(8_000_000).bitrate,
+            config(1280, 720)
+                .scale_bitrate_to_resolution(8_000_000)
+                .bitrate,
             3_555_555
         );
     }
@@ -106,10 +112,17 @@ mod tests {
     #[test]
     fn bitrate_stays_within_sane_bounds() {
         // Un écran minuscule ne doit pas tomber à un débit inexploitable…
-        assert_eq!(config(64, 64).scale_bitrate_to_resolution(8_000_000).bitrate, 500_000);
+        assert_eq!(
+            config(64, 64)
+                .scale_bitrate_to_resolution(8_000_000)
+                .bitrate,
+            500_000
+        );
         // …ni un mur d'écrans faire exploser le lien.
         assert_eq!(
-            config(15360, 8640).scale_bitrate_to_resolution(50_000_000).bitrate,
+            config(15360, 8640)
+                .scale_bitrate_to_resolution(50_000_000)
+                .bitrate,
             100_000_000
         );
     }

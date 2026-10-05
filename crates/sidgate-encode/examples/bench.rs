@@ -52,7 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut file = std::io::BufWriter::new(std::fs::File::create(&path)?);
     let mut frames: Vec<EncodedFrame> = Vec::with_capacity(8);
-    let (mut captured, mut encoded, mut idle, mut bytes, mut keyframes) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut captured, mut encoded, mut idle, mut bytes, mut keyframes) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut encode_total = Duration::ZERO;
 
     let start = Instant::now();
@@ -97,10 +98,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     file.flush()?;
 
     let elapsed = start.elapsed().as_secs_f64();
-    println!("images capturées : {captured} ({:.1} i/s)", captured as f64 / elapsed);
+    println!(
+        "images capturées : {captured} ({:.1} i/s)",
+        captured as f64 / elapsed
+    );
     println!("images encodées  : {encoded} (dont {keyframes} clés)");
     println!("cycles à vide    : {idle}");
-    println!("débit mesuré     : {:.2} Mbit/s", bytes as f64 * 8.0 / elapsed / 1e6);
+    println!(
+        "débit mesuré     : {:.2} Mbit/s",
+        bytes as f64 * 8.0 / elapsed / 1e6
+    );
     if captured > 0 {
         let t = encoder.take_timings();
         let per = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / captured as f64;

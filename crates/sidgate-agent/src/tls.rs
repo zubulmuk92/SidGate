@@ -36,7 +36,11 @@ pub struct TlsMaterial {
 /// `hosts` liste les noms et adresses sous lesquels l'agent sera joint : au
 /// minimum `localhost`, plus l'adresse d'écoute effective, sinon le navigateur
 /// refuse le certificat avant même de proposer l'exception.
-pub fn load_or_create(dir: &Path, bind: IpAddr, extra_hosts: &[String]) -> anyhow::Result<TlsMaterial> {
+pub fn load_or_create(
+    dir: &Path,
+    bind: IpAddr,
+    extra_hosts: &[String],
+) -> anyhow::Result<TlsMaterial> {
     let cert_path = dir.join(CERT_FILE);
     let key_path = dir.join(KEY_FILE);
 
@@ -81,8 +85,7 @@ pub fn load_or_create(dir: &Path, bind: IpAddr, extra_hosts: &[String]) -> anyho
 /// L'empreinte porte bien sur le DER, et non sur le texte PEM : c'est ce que
 /// les navigateurs affichent, sans quoi la comparaison visuelle serait fausse.
 fn fingerprint_of(cert_pem: &[u8]) -> anyhow::Result<String> {
-    let der = pem_to_der(cert_pem)
-        .ok_or_else(|| anyhow::anyhow!("certificat PEM illisible"))?;
+    let der = pem_to_der(cert_pem).ok_or_else(|| anyhow::anyhow!("certificat PEM illisible"))?;
     let digest = Sha256::digest(&der);
     Ok(digest
         .iter()
@@ -145,9 +148,9 @@ mod tests {
         let parts: Vec<&str> = material.fingerprint.split(':').collect();
         assert_eq!(parts.len(), 32, "SHA-256 fait 32 octets");
         assert!(parts.iter().all(|p| p.len() == 2));
-        assert!(parts
-            .iter()
-            .all(|p| p.chars().all(|c| c.is_ascii_hexdigit() && !c.is_lowercase())));
+        assert!(parts.iter().all(|p| p
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_lowercase())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

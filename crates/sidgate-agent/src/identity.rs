@@ -17,6 +17,19 @@
 //! Ni le tunnel WireGuard ni le TLS du transport ne sont considérés comme
 //! suffisants : ils protègent le lien, pas l'identité de ce qui se trouve au
 //! bout.
+//!
+//! # Deux processus, un registre
+//!
+//! L'agent tourne en permanence ; les commandes `pair`, `clients` et `revoke`
+//! sont des processus éphémères lancés à côté de lui. Ils ne se parlent pas :
+//! ils partagent le répertoire de données. Une demande d'appairage y est
+//! déposée sous forme de fichier, et le registre des clients est relu quand il
+//! a changé. Les deux ne sont consultés qu'à l'arrivée d'une connexion — il
+//! n'y a ni canal local à écouter ni fichier à surveiller, donc rien qui tourne
+//! quand personne ne se connecte.
+//!
+//! Qui peut écrire dans ce répertoire peut s'appairer : c'est pourquoi il est
+//! fermé aux autres comptes de la machine (voir le module `acl`).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -34,6 +47,8 @@ use sidgate_proto::signaling::{self, AuthError};
 const KEY_FILE: &str = "agent.key";
 /// Nom du fichier listant les clients appairés.
 const CLIENTS_FILE: &str = "clients.json";
+/// Nom du fichier portant une demande d'appairage déposée par `sidgate pair`.
+const TICKET_FILE: &str = "pairing.json";
 
 /// Alphabet du code d'appairage.
 ///
@@ -63,12 +78,42 @@ struct ClientStore {
     clients: Vec<PairedClient>,
 }
 
+/// Ce qu'un client présente pour prouver qu'il détient sa clé privée.
+///
+/// La signature porte sur une transcription qui inclut les deux aléas : elle
+/// ne vaut que pour cette connexion.
+#[derive(Debug, Clone, Copy)]
+pub struct Proof<'a> {
+    /// Clé publique ECDSA P-256 du client, en hexadécimal.
+    pub client_key_hex: &'a str,
+    /// Aléa tiré par l'agent pour cette connexion.
+    pub server_nonce: &'a [u8],
+    /// Aléa tiré par le client pour cette connexion.
+    pub client_nonce: &'a [u8],
+    /// Signature `r || s` de la transcription, en hexadécimal.
+    pub signature_hex: &'a str,
+}
+
+/// Demande d'appairage déposée dans le répertoire de données.
+#[derive(Debug, Serialize, Deserialize)]
+struct PairingTicket {
+    /// Code à saisir sur le client.
+    code: String,
+    /// Échéance, en secondes depuis l'époque Unix.
+    expires_at: u64,
+}
+
+/// État d'un fichier, pour savoir s'il a changé sans le relire.
+type FileStamp = Option<(SystemTime, u64)>;
+
 /// Identité de l'agent et registre des clients.
 #[derive(Debug)]
 pub struct Identity {
     signing_key: SigningKey,
     clients: Vec<PairedClient>,
     clients_path: PathBuf,
+    clients_stamp: FileStamp,
+    ticket_path: PathBuf,
     pairing: Option<PairingWindow>,
     attempts: HashMap<IpAddr, AttemptWindow>,
     attempts_per_minute: u32,
@@ -112,6 +157,7 @@ impl Identity {
             Err(e) => return Err(e.into()),
         };
 
+        let clients_stamp = stamp_of(&clients_path);
         let clients = match std::fs::read_to_string(&clients_path) {
             Ok(text) => serde_json::from_str::<ClientStore>(&text)?.clients,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -122,6 +168,8 @@ impl Identity {
             signing_key,
             clients,
             clients_path,
+            clients_stamp,
+            ticket_path: dir.join(TICKET_FILE),
             pairing: None,
             attempts: HashMap::new(),
             attempts_per_minute,
@@ -174,16 +222,61 @@ impl Identity {
         Ok(code)
     }
 
-    /// Ferme la fenêtre d'appairage.
+    /// Ferme la fenêtre d'appairage, y compris une demande déposée sur disque.
     pub fn close_pairing(&mut self) {
         self.pairing = None;
+        let _ = std::fs::remove_file(&self.ticket_path);
     }
 
     /// Une fenêtre d'appairage est-elle ouverte à cet instant ?
     pub fn pairing_open(&self) -> bool {
+        self.console_code().is_some() || read_ticket(&self.ticket_path).is_some()
+    }
+
+    /// Code de la fenêtre ouverte depuis la console de cet agent, si elle
+    /// n'a pas expiré.
+    fn console_code(&self) -> Option<&str> {
         self.pairing
             .as_ref()
-            .is_some_and(|w| w.opened.elapsed() < w.ttl)
+            .filter(|w| w.opened.elapsed() < w.ttl)
+            .map(|w| w.code.as_str())
+    }
+
+    /// Le client est-il encore autorisé ?
+    ///
+    /// Relit le registre s'il a changé : c'est par là qu'une révocation faite
+    /// depuis une autre invite atteint une session déjà ouverte.
+    pub fn is_authorized(&mut self, client_key_hex: &str) -> bool {
+        self.refresh_clients();
+        self.clients.iter().any(|c| c.key == client_key_hex)
+    }
+
+    /// Recharge le registre des clients s'il a été modifié par un autre
+    /// processus.
+    ///
+    /// Un fichier illisible ou corrompu laisse le registre en mémoire tel
+    /// quel : ne plus reconnaître personne sur une écriture ratée serait pire
+    /// que de garder la liste d'il y a une minute.
+    fn refresh_clients(&mut self) {
+        let stamp = stamp_of(&self.clients_path);
+        if stamp == self.clients_stamp {
+            return;
+        }
+        match std::fs::read_to_string(&self.clients_path) {
+            Ok(text) => match serde_json::from_str::<ClientStore>(&text) {
+                Ok(store) => {
+                    self.clients = store.clients;
+                    self.clients_stamp = stamp;
+                    tracing::info!(clients = self.clients.len(), "registre des clients relu");
+                }
+                Err(e) => tracing::warn!(error = %e, "registre des clients illisible, ignoré"),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.clients.clear();
+                self.clients_stamp = stamp;
+            }
+            Err(e) => tracing::warn!(error = %e, "registre des clients inaccessible"),
+        }
     }
 
     /// Signe la transcription d'authentification pour prouver l'identité de
@@ -199,15 +292,15 @@ impl Identity {
     }
 
     /// Vérifie l'authentification d'un client déjà appairé.
-    pub fn authenticate(
-        &mut self,
-        source: IpAddr,
-        client_key_hex: &str,
-        server_nonce: &[u8],
-        client_nonce: &[u8],
-        signature_hex: &str,
-    ) -> Result<String, AuthError> {
+    pub fn authenticate(&mut self, source: IpAddr, proof: Proof<'_>) -> Result<String, AuthError> {
+        let Proof {
+            client_key_hex,
+            server_nonce,
+            client_nonce,
+            signature_hex,
+        } = proof;
         self.check_rate_limit(source)?;
+        self.refresh_clients();
 
         let client_key = decode_client_key(client_key_hex)?;
         if !self.clients.iter().any(|c| c.key == client_key_hex) {
@@ -232,22 +325,32 @@ impl Identity {
         &mut self,
         source: IpAddr,
         code: &str,
-        client_key_hex: &str,
         label: &str,
-        server_nonce: &[u8],
-        client_nonce: &[u8],
-        signature_hex: &str,
+        proof: Proof<'_>,
     ) -> Result<String, AuthError> {
+        let Proof {
+            client_key_hex,
+            server_nonce,
+            client_nonce,
+            signature_hex,
+        } = proof;
         self.check_rate_limit(source)?;
+        self.refresh_clients();
 
-        let Some(window) = self.pairing.as_ref() else {
-            return Err(AuthError::PairingClosed);
-        };
-        if window.opened.elapsed() >= window.ttl {
+        // Deux origines possibles pour le code : la console de cet agent, ou
+        // une demande déposée par `sidgate pair`. Les deux sont comparées sans
+        // court-circuit, pour que la durée de l'appel ne dise pas laquelle
+        // était ouverte.
+        let ticket = read_ticket(&self.ticket_path);
+        let from_console = self
+            .console_code()
+            .is_some_and(|expected| codes_match(expected, code));
+        let from_ticket = ticket.as_ref().is_some_and(|t| codes_match(&t.code, code));
+        if self.console_code().is_none() && ticket.is_none() {
             self.pairing = None;
             return Err(AuthError::PairingClosed);
         }
-        if !codes_match(&window.code, code) {
+        if !(from_console | from_ticket) {
             tracing::warn!(%source, "code d'appairage incorrect");
             return Err(AuthError::Rejected);
         }
@@ -259,7 +362,12 @@ impl Identity {
 
         // Le code n'est valable qu'une fois : le conserver ouvert après un
         // appairage réussi laisserait une seconde fenêtre à quiconque l'a vu.
-        self.pairing = None;
+        if from_console {
+            self.pairing = None;
+        }
+        if from_ticket {
+            let _ = std::fs::remove_file(&self.ticket_path);
+        }
         self.attempts.remove(&source);
 
         let now = unix_now();
@@ -293,12 +401,65 @@ impl Identity {
         Ok(())
     }
 
-    fn persist_clients(&self) -> anyhow::Result<()> {
+    fn persist_clients(&mut self) -> anyhow::Result<()> {
         let store = ClientStore {
             clients: self.clients.clone(),
         };
-        write_private(&self.clients_path, serde_json::to_vec_pretty(&store)?.as_slice())
+        write_private(
+            &self.clients_path,
+            serde_json::to_vec_pretty(&store)?.as_slice(),
+        )?;
+        self.clients_stamp = stamp_of(&self.clients_path);
+        Ok(())
     }
+}
+
+/// Dépose une demande d'appairage dans `dir` et renvoie le code à saisir.
+///
+/// C'est ce qu'exécute `sidgate pair` : l'agent en service n'a pas de console
+/// où afficher un code, et n'écoute rien d'autre que le réseau. La demande est
+/// un fichier ; l'agent la lit à la prochaine connexion d'un client, la
+/// consomme au premier appairage réussi et l'efface à son échéance.
+pub fn write_pairing_ticket(dir: &Path, ttl: Duration) -> anyhow::Result<String> {
+    std::fs::create_dir_all(dir)?;
+    let code = generate_pairing_code()?;
+    let ticket = PairingTicket {
+        code: code.clone(),
+        expires_at: unix_now().saturating_add(ttl.as_secs()),
+    };
+    write_private(&dir.join(TICKET_FILE), &serde_json::to_vec(&ticket)?)?;
+    Ok(code)
+}
+
+/// Retire une demande d'appairage. Renvoie `true` s'il y en avait une.
+pub fn clear_pairing_ticket(dir: &Path) -> bool {
+    std::fs::remove_file(dir.join(TICKET_FILE)).is_ok()
+}
+
+/// Une demande d'appairage attend-elle encore dans `dir` ?
+pub fn pairing_ticket_pending(dir: &Path) -> bool {
+    read_ticket(&dir.join(TICKET_FILE)).is_some()
+}
+
+/// Lit la demande d'appairage, si elle existe et n'a pas expiré.
+///
+/// Une demande expirée ou illisible est effacée au passage : elle ne doit pas
+/// rester sur le disque à attendre qu'une horloge reculée la ressuscite.
+fn read_ticket(path: &Path) -> Option<PairingTicket> {
+    let bytes = std::fs::read(path).ok()?;
+    let ticket = serde_json::from_slice::<PairingTicket>(&bytes)
+        .ok()
+        .filter(|ticket| unix_now() < ticket.expires_at);
+    if ticket.is_none() {
+        let _ = std::fs::remove_file(path);
+    }
+    ticket
+}
+
+/// Date de modification et taille d'un fichier, ou `None` s'il n'existe pas.
+fn stamp_of(path: &Path) -> FileStamp {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 /// Décode une clé publique de client et la renvoie avec sa forme binaire.
@@ -398,9 +559,21 @@ fn generate_pairing_code() -> anyhow::Result<String> {
     Ok(code)
 }
 
-/// Écrit un fichier sensible.
+/// Écrit un fichier sensible, d'un seul tenant.
+///
+/// Le contenu passe par un fichier voisin, renommé ensuite : un autre processus
+/// qui lit au même instant voit l'ancienne version ou la nouvelle, jamais un
+/// fichier à moitié écrit. La confidentialité, elle, vient du répertoire, fermé
+/// aux autres comptes à sa création.
 fn write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
-    std::fs::write(path, contents)?;
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(".tmp");
+    let staging = PathBuf::from(staging);
+    std::fs::write(&staging, contents)?;
+    if let Err(e) = std::fs::rename(&staging, path) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -414,7 +587,6 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p256::ecdsa::signature::Signer as _;
     use p256::ecdsa::SigningKey as ClientSigningKey;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -465,11 +637,13 @@ mod tests {
         identity.pair(
             SOURCE,
             &code,
-            &client.key_hex,
             "Banc d'essai",
-            &SERVER_NONCE,
-            &CLIENT_NONCE,
-            &client.sign(&transcript),
+            Proof {
+                client_key_hex: &client.key_hex,
+                server_nonce: &SERVER_NONCE,
+                client_nonce: &CLIENT_NONCE,
+                signature_hex: &client.sign(&transcript),
+            },
         )
     }
 
@@ -499,10 +673,12 @@ mod tests {
         identity
             .authenticate(
                 SOURCE,
-                &client.key_hex,
-                &SERVER_NONCE,
-                &CLIENT_NONCE,
-                &client.sign(&transcript),
+                Proof {
+                    client_key_hex: &client.key_hex,
+                    server_nonce: &SERVER_NONCE,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &client.sign(&transcript),
+                },
             )
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -519,10 +695,12 @@ mod tests {
         assert_eq!(
             identity.authenticate(
                 SOURCE,
-                &client.key_hex,
-                &SERVER_NONCE,
-                &CLIENT_NONCE,
-                &client.sign(&transcript)
+                Proof {
+                    client_key_hex: &client.key_hex,
+                    server_nonce: &SERVER_NONCE,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &client.sign(&transcript),
+                }
             ),
             Err(AuthError::Rejected)
         );
@@ -542,10 +720,12 @@ mod tests {
         assert_eq!(
             identity.authenticate(
                 SOURCE,
-                &client.key_hex,
-                &SERVER_NONCE,
-                &CLIENT_NONCE,
-                &impostor.sign(&transcript)
+                Proof {
+                    client_key_hex: &client.key_hex,
+                    server_nonce: &SERVER_NONCE,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &impostor.sign(&transcript),
+                }
             ),
             Err(AuthError::Rejected)
         );
@@ -569,10 +749,12 @@ mod tests {
         assert_eq!(
             identity.authenticate(
                 SOURCE,
-                &client.key_hex,
-                &fresh_nonce,
-                &CLIENT_NONCE,
-                &captured
+                Proof {
+                    client_key_hex: &client.key_hex,
+                    server_nonce: &fresh_nonce,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &captured,
+                }
             ),
             Err(AuthError::Rejected)
         );
@@ -594,10 +776,12 @@ mod tests {
         assert_eq!(
             identity.authenticate(
                 SOURCE,
-                &client.key_hex,
-                &SERVER_NONCE,
-                &CLIENT_NONCE,
-                &pairing_signature
+                Proof {
+                    client_key_hex: &client.key_hex,
+                    server_nonce: &SERVER_NONCE,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &pairing_signature,
+                }
             ),
             Err(AuthError::Rejected),
             "la séparation de domaine doit empêcher la réutilisation"
@@ -618,11 +802,13 @@ mod tests {
             identity.pair(
                 SOURCE,
                 "0000-0000",
-                &client.key_hex,
                 "x",
-                &SERVER_NONCE,
-                &CLIENT_NONCE,
-                &client.sign(&transcript)
+                Proof {
+                    client_key_hex: &client.key_hex,
+                    server_nonce: &SERVER_NONCE,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &client.sign(&transcript),
+                }
             ),
             Err(AuthError::Rejected)
         );
@@ -642,11 +828,13 @@ mod tests {
             identity.pair(
                 SOURCE,
                 "ABCD-EFGH",
-                &client.key_hex,
                 "x",
-                &SERVER_NONCE,
-                &CLIENT_NONCE,
-                &client.sign(&transcript)
+                Proof {
+                    client_key_hex: &client.key_hex,
+                    server_nonce: &SERVER_NONCE,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &client.sign(&transcript),
+                }
             ),
             Err(AuthError::PairingClosed)
         );
@@ -672,22 +860,26 @@ mod tests {
             .pair(
                 SOURCE,
                 &code,
-                &first.key_hex,
                 "premier",
-                &SERVER_NONCE,
-                &CLIENT_NONCE,
-                &sign(&first),
+                Proof {
+                    client_key_hex: &first.key_hex,
+                    server_nonce: &SERVER_NONCE,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &sign(&first),
+                },
             )
             .unwrap();
         assert_eq!(
             identity.pair(
                 SOURCE,
                 &code,
-                &second.key_hex,
                 "second",
-                &SERVER_NONCE,
-                &CLIENT_NONCE,
-                &sign(&second)
+                Proof {
+                    client_key_hex: &second.key_hex,
+                    server_nonce: &SERVER_NONCE,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &sign(&second),
+                }
             ),
             Err(AuthError::PairingClosed)
         );
@@ -705,6 +897,213 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn pair_with_code(
+        identity: &mut Identity,
+        client: &TestClient,
+        code: &str,
+    ) -> Result<String, AuthError> {
+        let transcript =
+            signaling::client_pair_transcript(&SERVER_NONCE, &CLIENT_NONCE, &client.key_bytes);
+        identity.pair(
+            SOURCE,
+            code,
+            "Banc d'essai",
+            Proof {
+                client_key_hex: &client.key_hex,
+                server_nonce: &SERVER_NONCE,
+                client_nonce: &CLIENT_NONCE,
+                signature_hex: &client.sign(&transcript),
+            },
+        )
+    }
+
+    fn authenticate(identity: &mut Identity, client: &TestClient) -> Result<String, AuthError> {
+        let transcript =
+            signaling::client_auth_transcript(&SERVER_NONCE, &CLIENT_NONCE, &client.key_bytes);
+        identity.authenticate(
+            SOURCE,
+            Proof {
+                client_key_hex: &client.key_hex,
+                server_nonce: &SERVER_NONCE,
+                client_nonce: &CLIENT_NONCE,
+                signature_hex: &client.sign(&transcript),
+            },
+        )
+    }
+
+    #[test]
+    fn a_ticket_dropped_by_another_process_opens_pairing() {
+        let dir = temp_dir("ticket");
+        let mut identity = Identity::load_or_create(&dir, 100).unwrap();
+        assert!(!identity.pairing_open());
+
+        // Ce que fait `sidgate pair`, depuis un autre processus.
+        let code = write_pairing_ticket(&dir, Duration::from_secs(60)).unwrap();
+        assert!(identity.pairing_open());
+        assert!(pairing_ticket_pending(&dir));
+
+        let client = TestClient::new();
+        pair_with_code(&mut identity, &client, &code).unwrap();
+        assert_eq!(identity.clients().len(), 1);
+
+        // Usage unique : la demande disparaît avec l'appairage.
+        assert!(!pairing_ticket_pending(&dir));
+        assert!(!identity.pairing_open());
+        assert_eq!(
+            pair_with_code(&mut identity, &TestClient::new(), &code),
+            Err(AuthError::PairingClosed)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wrong_code_does_not_consume_the_ticket() {
+        let dir = temp_dir("ticket-wrong");
+        let mut identity = Identity::load_or_create(&dir, 100).unwrap();
+        let code = write_pairing_ticket(&dir, Duration::from_secs(60)).unwrap();
+
+        assert_eq!(
+            pair_with_code(&mut identity, &TestClient::new(), "0000-0000"),
+            Err(AuthError::Rejected)
+        );
+        assert!(identity.clients().is_empty());
+        assert!(
+            pairing_ticket_pending(&dir),
+            "une faute de frappe ne ferme pas la fenêtre"
+        );
+        pair_with_code(&mut identity, &TestClient::new(), &code).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_ticket_is_refused_and_erased() {
+        let dir = temp_dir("ticket-expired");
+        let mut identity = Identity::load_or_create(&dir, 100).unwrap();
+        let ticket = PairingTicket {
+            code: "ABCD-EFGH".into(),
+            expires_at: unix_now() - 1,
+        };
+        std::fs::write(dir.join(TICKET_FILE), serde_json::to_vec(&ticket).unwrap()).unwrap();
+
+        assert!(!identity.pairing_open());
+        assert!(
+            !dir.join(TICKET_FILE).exists(),
+            "une demande expirée ne reste pas sur le disque"
+        );
+        assert_eq!(
+            pair_with_code(&mut identity, &TestClient::new(), "ABCD-EFGH"),
+            Err(AuthError::PairingClosed)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_ticket_opens_nothing() {
+        let dir = temp_dir("ticket-garbage");
+        let identity = Identity::load_or_create(&dir, 100).unwrap();
+        std::fs::write(dir.join(TICKET_FILE), b"{\"code\":\"ABCD-EFGH\"}").unwrap();
+        assert!(!identity.pairing_open());
+        assert!(!dir.join(TICKET_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_pairing_from_the_console_also_withdraws_the_ticket() {
+        let dir = temp_dir("ticket-close");
+        let mut identity = Identity::load_or_create(&dir, 100).unwrap();
+        write_pairing_ticket(&dir, Duration::from_secs(60)).unwrap();
+        identity.open_pairing(Duration::from_secs(60)).unwrap();
+        identity.close_pairing();
+        assert!(!identity.pairing_open());
+        assert!(!clear_pairing_ticket(&dir), "il n'y a plus rien à retirer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_console_window_and_a_ticket_are_independent() {
+        let dir = temp_dir("ticket-both");
+        let mut identity = Identity::load_or_create(&dir, 100).unwrap();
+        let from_console = identity.open_pairing(Duration::from_secs(60)).unwrap();
+        let from_ticket = write_pairing_ticket(&dir, Duration::from_secs(60)).unwrap();
+
+        pair_with_code(&mut identity, &TestClient::new(), &from_ticket).unwrap();
+        assert!(
+            identity.pairing_open(),
+            "la fenêtre de la console reste ouverte"
+        );
+        pair_with_code(&mut identity, &TestClient::new(), &from_console).unwrap();
+        assert!(!identity.pairing_open());
+        assert_eq!(identity.clients().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_revocation_made_by_another_process_reaches_the_running_agent() {
+        let dir = temp_dir("revoke-external");
+        let mut agent = Identity::load_or_create(&dir, 100).unwrap();
+        let client = TestClient::new();
+        pair_client(&mut agent, &client).unwrap();
+        authenticate(&mut agent, &client).unwrap();
+        assert!(agent.is_authorized(&client.key_hex));
+
+        // `sidgate revoke`, dans un autre processus : sa propre copie du
+        // registre, écrite sur le disque.
+        let mut cli = Identity::load_or_create(&dir, 100).unwrap();
+        assert!(cli.revoke(&client.key_hex).unwrap());
+
+        assert!(!agent.is_authorized(&client.key_hex));
+        assert_eq!(authenticate(&mut agent, &client), Err(AuthError::Rejected));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_agent_does_not_resurrect_a_revoked_client() {
+        let dir = temp_dir("revoke-stale");
+        let mut agent = Identity::load_or_create(&dir, 100).unwrap();
+        let (kept, revoked) = (TestClient::new(), TestClient::new());
+        pair_client(&mut agent, &kept).unwrap();
+        pair_client(&mut agent, &revoked).unwrap();
+
+        let mut cli = Identity::load_or_create(&dir, 100).unwrap();
+        cli.revoke(&revoked.key_hex).unwrap();
+
+        // L'agent réécrit le registre à chaque connexion réussie, pour dater
+        // la dernière visite : il ne doit pas le faire depuis une copie
+        // antérieure à la révocation.
+        authenticate(&mut agent, &kept).unwrap();
+        let reloaded = Identity::load_or_create(&dir, 100).unwrap();
+        assert_eq!(reloaded.clients().len(), 1);
+        assert_eq!(reloaded.clients()[0].key, kept.key_hex);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupted_registry_keeps_the_known_clients() {
+        let dir = temp_dir("registry-corrupt");
+        let mut agent = Identity::load_or_create(&dir, 100).unwrap();
+        let client = TestClient::new();
+        pair_client(&mut agent, &client).unwrap();
+
+        std::fs::write(dir.join(CLIENTS_FILE), b"{ pas du json").unwrap();
+        assert!(agent.is_authorized(&client.key_hex));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn private_files_are_replaced_whole() {
+        let dir = temp_dir("atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+        write_private(&path, b"premier").unwrap();
+        write_private(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert!(
+            !dir.join("secret.tmp").exists(),
+            "aucun fichier de transit ne doit rester"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn brute_force_is_rate_limited() {
         let dir = temp_dir("ratelimit");
@@ -718,10 +1117,12 @@ mod tests {
             assert_eq!(
                 identity.authenticate(
                     SOURCE,
-                    &client.key_hex,
-                    &SERVER_NONCE,
-                    &CLIENT_NONCE,
-                    &signature
+                    Proof {
+                        client_key_hex: &client.key_hex,
+                        server_nonce: &SERVER_NONCE,
+                        client_nonce: &CLIENT_NONCE,
+                        signature_hex: &signature,
+                    }
                 ),
                 Err(AuthError::Rejected)
             );
@@ -729,10 +1130,12 @@ mod tests {
         assert_eq!(
             identity.authenticate(
                 SOURCE,
-                &client.key_hex,
-                &SERVER_NONCE,
-                &CLIENT_NONCE,
-                &signature
+                Proof {
+                    client_key_hex: &client.key_hex,
+                    server_nonce: &SERVER_NONCE,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &signature,
+                }
             ),
             Err(AuthError::RateLimited)
         );
@@ -754,10 +1157,12 @@ mod tests {
         assert_eq!(
             identity.authenticate(
                 SOURCE,
-                &client.key_hex,
-                &SERVER_NONCE,
-                &CLIENT_NONCE,
-                &client.sign(&transcript)
+                Proof {
+                    client_key_hex: &client.key_hex,
+                    server_nonce: &SERVER_NONCE,
+                    client_nonce: &CLIENT_NONCE,
+                    signature_hex: &client.sign(&transcript),
+                }
             ),
             Err(AuthError::Rejected)
         );
@@ -774,10 +1179,9 @@ mod tests {
 
         let public = signaling::from_hex_exact::<32>(&identity.public_key_hex()).unwrap();
         let verifying = ed25519_dalek::VerifyingKey::from_bytes(&public).unwrap();
-        let signature = ed25519_dalek::Signature::from_slice(
-            &signaling::from_hex(&signature_hex).unwrap(),
-        )
-        .unwrap();
+        let signature =
+            ed25519_dalek::Signature::from_slice(&signaling::from_hex(&signature_hex).unwrap())
+                .unwrap();
         let transcript = signaling::agent_transcript(&SERVER_NONCE, &CLIENT_NONCE, &client_key);
         assert!(ed25519_dalek::Verifier::verify(&verifying, &transcript, &signature).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
@@ -807,7 +1211,10 @@ mod tests {
     fn labels_are_sanitized() {
         assert_eq!(sanitize_label("Pixel 8"), "Pixel 8");
         assert_eq!(sanitize_label("  "), "appareil sans nom");
-        assert_eq!(sanitize_label("<script>alert(1)</script>"), "scriptalert1script");
+        assert_eq!(
+            sanitize_label("<script>alert(1)</script>"),
+            "scriptalert1script"
+        );
         assert_eq!(sanitize_label(&"x".repeat(100)).len(), 48);
     }
 }

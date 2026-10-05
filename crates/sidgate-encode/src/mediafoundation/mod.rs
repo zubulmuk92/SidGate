@@ -29,9 +29,7 @@ use bytes::Bytes;
 use windows::core::{Interface, GUID, PWSTR};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::{
-    CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED,
-};
+use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::VARIANT;
 
 use crate::{EncodeError, EncodedFrame, EncoderConfig};
@@ -250,9 +248,8 @@ impl MediaFoundationEncoder {
             return;
         };
         // SAFETY: la valeur est copiée par l'appel.
-        let result = unsafe {
-            codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32))
-        };
+        let result =
+            unsafe { codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32)) };
         if let Err(e) = result {
             tracing::debug!(error = %e, "image clé forcée non supportée par cet encodeur");
         }
@@ -265,8 +262,9 @@ impl MediaFoundationEncoder {
             return;
         };
         // SAFETY: la valeur est copiée par l'appel.
-        let result =
-            unsafe { codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate)) };
+        let result = unsafe {
+            codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate))
+        };
         match result {
             Ok(()) => tracing::info!(bitrate, "débit cible ajusté"),
             Err(e) => tracing::debug!(error = %e, "débit non ajustable à chaud"),
@@ -381,8 +379,9 @@ impl MediaFoundationEncoder {
             return Ok(None);
         }
 
-        // SAFETY: lectures d'attributs sur un échantillon détenu par l'appelant.
+        // SAFETY: lecture d'attribut sur un échantillon détenu par l'appelant.
         let keyframe = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) == 1;
+        // SAFETY: même échantillon, même garantie.
         let time_hns = unsafe { sample.GetSampleTime() }.unwrap_or(0).max(0) as u64;
 
         // Le client peut se raccrocher au flux à tout moment : une image clé
@@ -589,10 +588,8 @@ fn configure_encoder(
 
     // SAFETY: le gestionnaire survit à la transformation, tous deux étant
     // détenus par l'encodeur.
-    unsafe {
-        transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
-    }
-    .map_err(map_error)?;
+    unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize) }
+        .map_err(map_error)?;
 
     let output_type = build_output_type(config)?;
     // SAFETY: le type vient d'être construit et vit pendant l'appel.
@@ -705,14 +702,8 @@ fn read_sequence_header(transform: &IMFTransform) -> Vec<u8> {
     let mut buffer = vec![0u8; length as usize];
     let mut written = 0u32;
     // SAFETY: `buffer` a exactement la taille annoncée par l'appel précédent.
-    if unsafe {
-        media_type.GetBlob(
-            &MF_MT_MPEG_SEQUENCE_HEADER,
-            &mut buffer,
-            Some(&mut written),
-        )
-    }
-    .is_err()
+    if unsafe { media_type.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buffer, Some(&mut written)) }
+        .is_err()
     {
         return Vec::new();
     }
@@ -727,10 +718,8 @@ fn read_sequence_header(transform: &IMFTransform) -> Vec<u8> {
 fn wrap_texture_in_sample(texture: &ID3D11Texture2D) -> Result<IMFSample, EncodeError> {
     // SAFETY: `texture` est détenue par le convertisseur, lui-même détenu par
     // la surface qui portera cet échantillon.
-    let buffer = unsafe {
-        MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)
-    }
-    .map_err(map_error)?;
+    let buffer = unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false) }
+        .map_err(map_error)?;
 
     // Un tampon DXGI naît avec une longueur nulle ; l'encodeur refuserait un
     // échantillon vide.

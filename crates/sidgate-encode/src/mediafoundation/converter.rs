@@ -29,12 +29,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
-    D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
 
 use crate::EncodeError;
 
@@ -100,8 +98,8 @@ impl Nv12Converter {
         let enumerator: ID3D11VideoProcessorEnumerator =
             unsafe { video_device.CreateVideoProcessorEnumerator(&content) }.map_err(map_error)?;
         // SAFETY: `enumerator` est détenu localement pendant l'appel.
-        let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
-            .map_err(map_error)?;
+        let processor =
+            unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }.map_err(map_error)?;
 
         let output = create_nv12_texture(device, width, height)?;
 
@@ -134,9 +132,7 @@ impl Nv12Converter {
         let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
             Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                Texture2D: windows::Win32::Graphics::Direct3D11::D3D11_TEX2D_VPOV {
-                    MipSlice: 0,
-                },
+                Texture2D: windows::Win32::Graphics::Direct3D11::D3D11_TEX2D_VPOV { MipSlice: 0 },
             },
         };
         let mut output_view = None;

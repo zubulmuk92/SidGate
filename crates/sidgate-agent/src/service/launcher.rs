@@ -254,7 +254,9 @@ fn system_token_in_session(session: u32) -> anyhow::Result<OwnedHandle> {
         )
     }
     .map_err(|e| {
-        anyhow::anyhow!("bascule du jeton vers la session {session} refusée (SeTcbPrivilege requis): {e}")
+        anyhow::anyhow!(
+            "bascule du jeton vers la session {session} refusée (SeTcbPrivilege requis): {e}"
+        )
     })?;
 
     Ok(duplicate)

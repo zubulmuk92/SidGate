@@ -29,13 +29,16 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_NOT_FOUND,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED,
+    DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
 };
 
 use crate::desktop::DesktopGuard;
-use crate::{CaptureError, DesktopInfo, FrameSource, FrameStatus};
+use crate::pointer::{PointerShape, ShapeKind};
+use crate::{CaptureError, DesktopInfo, FrameSource, FrameStatus, OutputInfo};
 
 /// Position du pointeur telle que rapportée par le compositeur.
 ///
@@ -44,11 +47,12 @@ use crate::{CaptureError, DesktopInfo, FrameSource, FrameStatus};
 /// un curseur fluide malgré la latence réseau, et cela ne coûte rien au GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PointerState {
-    /// Abscisse dans l'espace du bureau capturé.
+    /// Abscisse du coin haut-gauche de l'image du curseur, dans l'espace du
+    /// bureau capturé. Le point chaud se trouve décalé de celui de la forme.
     pub x: i32,
-    /// Ordonnée dans l'espace du bureau capturé.
+    /// Ordonnée du coin haut-gauche de l'image du curseur.
     pub y: i32,
-    /// Le curseur est-il visible ?
+    /// Le curseur est-il visible sur cette sortie ?
     pub visible: bool,
 }
 
@@ -64,6 +68,10 @@ pub struct DxgiCapturer {
     target_resource: ID3D11Resource,
     info: DesktopInfo,
     pointer: PointerState,
+    /// Forme livrée par le compositeur et pas encore réclamée par l'appelant.
+    pending_shape: Option<PointerShape>,
+    /// Tampon de lecture des formes, réutilisé d'un changement à l'autre.
+    shape_buffer: Vec<u8>,
     /// Detenu pour son `Drop` seul, jamais lu. Declare en dernier : le thread
     /// ne revient a son bureau d'origine qu'une fois la duplication et le
     /// device liberes, l'ordre de destruction suivant l'ordre de declaration.
@@ -91,6 +99,11 @@ impl DxgiCapturer {
         let desktop = DesktopGuard::attach_to_input_desktop()?;
 
         let (adapter, output) = find_output(output_index)?;
+        // SAFETY: `output` est une interface vivante ; la description est une
+        // structure rendue par valeur.
+        let coordinates = unsafe { output.GetDesc() }
+            .map_err(map_hresult)?
+            .DesktopCoordinates;
         let (device, context) = create_device(&adapter)?;
 
         // Le device est partagé avec l'encodeur, qui peut le solliciter depuis
@@ -115,6 +128,8 @@ impl DxgiCapturer {
             width: desc.ModeDesc.Width,
             height: desc.ModeDesc.Height,
             output_index,
+            left: coordinates.left,
+            top: coordinates.top,
         };
 
         let target = create_target_texture(&device, info.width, info.height)?;
@@ -135,6 +150,8 @@ impl DxgiCapturer {
             target_resource,
             info,
             pointer: PointerState::default(),
+            pending_shape: None,
+            shape_buffer: Vec::new(),
             _desktop: desktop,
         })
     }
@@ -165,6 +182,15 @@ impl DxgiCapturer {
     pub fn pointer(&self) -> PointerState {
         self.pointer
     }
+
+    /// Rend la forme du curseur si elle a changé depuis le dernier appel.
+    ///
+    /// Le compositeur ne livre une forme qu'à son changement, et toujours avec
+    /// la première image d'une duplication neuve : un client qui arrive reçoit
+    /// donc la forme courante sans avoir à la demander.
+    pub fn take_pointer_shape(&mut self) -> Option<PointerShape> {
+        self.pending_shape.take()
+    }
 }
 
 impl FrameSource for DxgiCapturer {
@@ -179,8 +205,10 @@ impl FrameSource for DxgiCapturer {
 
         // SAFETY: `frame_info` et `resource` vivent jusqu'à la fin de la
         // fonction ; le pilote écrit dans les deux avant de rendre la main.
-        let acquired =
-            unsafe { self.duplication.AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource) };
+        let acquired = unsafe {
+            self.duplication
+                .AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource)
+        };
 
         match acquired {
             Ok(()) => {}
@@ -216,6 +244,12 @@ impl DxgiCapturer {
             };
         }
 
+        if frame_info.PointerShapeBufferSize != 0 {
+            if let Some(shape) = self.read_pointer_shape(frame_info.PointerShapeBufferSize) {
+                self.pending_shape = Some(shape);
+            }
+        }
+
         // `LastPresentTime == 0` signifie qu'aucun pixel n'a changé : seul le
         // curseur a bougé. Rien à encoder.
         if frame_info.LastPresentTime == 0 {
@@ -237,6 +271,52 @@ impl DxgiCapturer {
         })
     }
 
+    /// Lit et convertit la forme du curseur attachée à l'image en vol.
+    ///
+    /// Un échec n'interrompt jamais la capture : le curseur garde simplement sa
+    /// forme précédente.
+    fn read_pointer_shape(&mut self, size: u32) -> Option<PointerShape> {
+        self.shape_buffer.resize(size as usize, 0);
+        let mut required = 0u32;
+        let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+
+        // SAFETY: le tampon fait exactement `size` octets, taille annoncée par
+        // le compositeur pour cette image ; `required` et `info` sont des
+        // locaux vivants pendant l'appel. L'image est encore détenue, condition
+        // d'appel de `GetFramePointerShape`.
+        let read = unsafe {
+            self.duplication.GetFramePointerShape(
+                size,
+                self.shape_buffer.as_mut_ptr().cast(),
+                &mut required,
+                &mut info,
+            )
+        };
+        if let Err(e) = read {
+            tracing::debug!(error = %e, "forme du curseur illisible");
+            return None;
+        }
+
+        let kind = match info.Type as i32 {
+            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 => ShapeKind::Monochrome,
+            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 => ShapeKind::Color,
+            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 => ShapeKind::MaskedColor,
+            other => {
+                tracing::debug!(kind = other, "type de curseur inconnu");
+                return None;
+            }
+        };
+        let used = (required as usize).min(self.shape_buffer.len());
+        PointerShape::convert(
+            kind,
+            info.Width,
+            info.Height,
+            info.Pitch,
+            (info.HotSpot.x, info.HotSpot.y),
+            &self.shape_buffer[..used],
+        )
+    }
+
     fn release(&self) -> Result<(), CaptureError> {
         // SAFETY: appelé exactement une fois par acquisition réussie.
         match unsafe { self.duplication.ReleaseFrame() } {
@@ -247,8 +327,13 @@ impl DxgiCapturer {
     }
 }
 
-/// Localise l'adaptateur et la sortie correspondant à un index global.
-fn find_output(output_index: u32) -> Result<(IDXGIAdapter1, IDXGIOutput1), CaptureError> {
+/// Parcourt les sorties de tous les adaptateurs, dans l'ordre d'énumération.
+///
+/// C'est cet ordre qui définit l'index global d'une sortie. Le parcours
+/// s'arrête dès que `visit` renvoie une valeur.
+fn visit_outputs<T>(
+    mut visit: impl FnMut(u32, &IDXGIAdapter1, IDXGIOutput) -> Result<Option<T>, CaptureError>,
+) -> Result<Option<T>, CaptureError> {
     // SAFETY: la fabrique est immédiatement détenue par la variable locale.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(map_hresult)?;
 
@@ -268,14 +353,48 @@ fn find_output(output_index: u32) -> Result<(IDXGIAdapter1, IDXGIOutput1), Captu
                 Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
                 Err(e) => return Err(map_hresult(e)),
             };
-            if seen == output_index {
-                let output1: IDXGIOutput1 = output.cast().map_err(map_hresult)?;
-                return Ok((adapter, output1));
+            if let Some(found) = visit(seen, &adapter, output)? {
+                return Ok(Some(found));
             }
             seen += 1;
         }
     }
-    Err(CaptureError::OutputNotFound(output_index))
+    Ok(None)
+}
+
+/// Localise l'adaptateur et la sortie correspondant à un index global.
+fn find_output(output_index: u32) -> Result<(IDXGIAdapter1, IDXGIOutput1), CaptureError> {
+    visit_outputs(|index, adapter, output| {
+        if index != output_index {
+            return Ok(None);
+        }
+        let output1: IDXGIOutput1 = output.cast().map_err(map_hresult)?;
+        Ok(Some((adapter.clone(), output1)))
+    })?
+    .ok_or(CaptureError::OutputNotFound(output_index))
+}
+
+/// Liste les sorties vidéo attachées au bureau.
+///
+/// Ne crée ni device ni duplication : l'appel est sans effet sur le GPU et peut
+/// être fait depuis n'importe quel thread.
+pub fn enumerate_outputs() -> Result<Vec<OutputInfo>, CaptureError> {
+    let mut outputs = Vec::new();
+    visit_outputs(|index, _adapter, output| {
+        // SAFETY: `output` est une interface vivante ; la description est une
+        // structure rendue par valeur.
+        let desc = unsafe { output.GetDesc() }.map_err(map_hresult)?;
+        let rect = desc.DesktopCoordinates;
+        outputs.push(OutputInfo {
+            index,
+            left: rect.left,
+            top: rect.top,
+            width: (rect.right - rect.left).max(0) as u32,
+            height: (rect.bottom - rect.top).max(0) as u32,
+        });
+        Ok(None::<()>)
+    })?;
+    Ok(outputs)
 }
 
 /// Crée le device D3D11 sur l'adaptateur qui pilote réellement la sortie.

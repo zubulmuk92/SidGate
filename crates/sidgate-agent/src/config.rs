@@ -14,7 +14,7 @@ use sidgate_proto::control::QualityPreset;
 pub const CONFIG_FILE: &str = "sidgate.toml";
 
 /// Configuration complète de l'agent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Écoute réseau et signalisation.
@@ -58,12 +58,18 @@ pub struct NetworkConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
-    /// Index de la sortie vidéo à dupliquer.
+    /// Index de la sortie vidéo dupliquée à l'ouverture d'une session. Le
+    /// client peut ensuite en changer.
     pub output: u32,
     /// Cadence maximale, en images par seconde.
     pub framerate: u32,
     /// Palier de qualité initial.
     pub quality: QualityPreset,
+    /// Baisser le débit quand le client rapporte des pertes.
+    ///
+    /// Le palier de qualité devient alors un plafond. À désactiver sur un
+    /// réseau filaire dont on veut un débit strictement constant.
+    pub adaptive_bitrate: bool,
 }
 
 /// Garde-fous de sécurité.
@@ -74,22 +80,17 @@ pub struct SecurityConfig {
     pub allow_power_actions: bool,
     /// Autoriser l'injection de souris et de clavier.
     pub allow_input: bool,
+    /// Autoriser un client à lire le texte du presse-papiers de l'hôte.
+    ///
+    /// Refusé par défaut : le presse-papiers contient volontiers un mot de
+    /// passe copié une minute plus tôt.
+    pub allow_clipboard: bool,
     /// Verrouiller la session dès la perte du transport.
     pub lock_on_disconnect: bool,
     /// Durée pendant laquelle un code d'appairage reste valable, en secondes.
     pub pairing_window_secs: u64,
     /// Tentatives d'authentification tolérées par minute et par adresse.
     pub auth_attempts_per_minute: u32,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            network: NetworkConfig::default(),
-            video: VideoConfig::default(),
-            security: SecurityConfig::default(),
-        }
-    }
 }
 
 impl Default for NetworkConfig {
@@ -109,6 +110,7 @@ impl Default for VideoConfig {
             output: 0,
             framerate: 60,
             quality: QualityPreset::Balanced,
+            adaptive_bitrate: true,
         }
     }
 }
@@ -118,6 +120,7 @@ impl Default for SecurityConfig {
         Self {
             allow_power_actions: false,
             allow_input: true,
+            allow_clipboard: false,
             lock_on_disconnect: true,
             pairing_window_secs: 120,
             auth_attempts_per_minute: 10,
@@ -131,7 +134,7 @@ impl Config {
         let path = dir.join(CONFIG_FILE);
         if !path.exists() {
             let config = Self::default();
-            std::fs::create_dir_all(dir)?;
+            crate::acl::create_private_dir(dir)?;
             std::fs::write(&path, toml::to_string_pretty(&config)?)?;
             tracing::info!(path = %path.display(), "configuration par défaut écrite");
             return Ok(config);
@@ -155,7 +158,8 @@ impl Config {
         );
         anyhow::ensure!(
             self.network.tls || self.network.bind.is_loopback(),
-            "servir en clair n'est autorisé que sur la boucle locale ; sur {} un              navigateur refuserait WebRTC faute de contexte sécurisé",
+            "servir en clair n'est autorisé que sur la boucle locale ; sur {} un \
+             navigateur refuserait WebRTC faute de contexte sécurisé",
             self.network.bind
         );
         Ok(())
@@ -176,7 +180,8 @@ pub fn data_dir() -> PathBuf {
     for key in ["ProgramData", "LOCALAPPDATA", "HOME"] {
         if let Some(base) = std::env::var_os(key) {
             let candidate = PathBuf::from(base).join("sidgate");
-            if std::fs::create_dir_all(&candidate).is_ok() {
+            // Créé fermé aux autres comptes : il va recevoir la clé privée.
+            if crate::acl::create_private_dir(&candidate).is_ok() {
                 return candidate;
             }
         }
@@ -196,6 +201,10 @@ mod tests {
             "les actions d'alimentation doivent être refusées par défaut"
         );
         assert!(config.security.lock_on_disconnect);
+        assert!(
+            !config.security.allow_clipboard,
+            "le presse-papiers de l'hôte ne doit pas être lisible par défaut"
+        );
         assert!(
             config.network.bind.is_loopback(),
             "l'écoute par défaut ne doit pas sortir de la machine"
@@ -225,6 +234,19 @@ mod tests {
         assert_eq!(config.network.port, 9000);
         assert!(!config.security.allow_power_actions);
         assert_eq!(config.video.framerate, 60);
+    }
+
+    #[test]
+    fn a_configuration_written_by_an_older_version_still_loads() {
+        // Fichier tel que l'écrivait la 0.1 : sans les clés apparues depuis.
+        let text =
+            "[network]\nbind = \"127.0.0.1\"\nport = 8443\ntls = true\nstun_servers = []\n\n\
+                    [video]\noutput = 0\nframerate = 60\nquality = \"balanced\"\n\n\
+                    [security]\nallow_power_actions = false\nallow_input = true\n\
+                    lock_on_disconnect = true\npairing_window_secs = 120\n\
+                    auth_attempts_per_minute = 10\n";
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(config, Config::default());
     }
 
     #[test]

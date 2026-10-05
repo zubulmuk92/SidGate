@@ -20,10 +20,7 @@ use std::path::{Path, PathBuf};
 /// chaîne construite à l'exécution, donc rien venu du réseau ne peut
 /// l'atteindre. C'est cette garantie, et non la relecture, qui rend l'exception
 /// acceptable.
-const ALLOWED: &[(&str, &str)] = &[(
-    "service/launcher.rs",
-    "CreateProcessAsUserW",
-)];
+const ALLOWED: &[(&str, &str)] = &[("service/launcher.rs", "CreateProcessAsUserW")];
 
 /// Motifs interdits, avec l'explication qui accompagnera l'échec.
 const FORBIDDEN: &[(&str, &str)] = &[
@@ -34,9 +31,18 @@ const FORBIDDEN: &[(&str, &str)] = &[
     ("CreateProcessA", "création de processus Win32"),
     // Les variantes qui prennent un jeton : c'est par elles que passe le
     // superviseur, et il faut donc les surveiller, pas les ignorer.
-    ("CreateProcessAsUserW", "création de processus sous un autre jeton"),
-    ("CreateProcessWithTokenW", "création de processus sous un autre jeton"),
-    ("CreateProcessWithLogonW", "création de processus sous d'autres identifiants"),
+    (
+        "CreateProcessAsUserW",
+        "création de processus sous un autre jeton",
+    ),
+    (
+        "CreateProcessWithTokenW",
+        "création de processus sous un autre jeton",
+    ),
+    (
+        "CreateProcessWithLogonW",
+        "création de processus sous d'autres identifiants",
+    ),
     ("ShellExecuteW", "lancement par le shell"),
     ("ShellExecuteA", "lancement par le shell"),
     ("WinExec", "lancement de programme"),
@@ -120,7 +126,10 @@ fn the_only_process_creation_takes_a_compile_time_command_line() {
 
 #[test]
 fn identifier_matching_does_not_fire_on_substrings() {
-    assert!(contains_identifier("unsafe { CreateProcessW(...) }", "CreateProcessW"));
+    assert!(contains_identifier(
+        "unsafe { CreateProcessW(...) }",
+        "CreateProcessW"
+    ));
     assert!(!contains_identifier(
         "CreateProcessAsUserW(token, ...)",
         "CreateProcessA"
