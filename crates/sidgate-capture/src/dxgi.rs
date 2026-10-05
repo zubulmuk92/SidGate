@@ -27,7 +27,10 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED,
+    DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED,
@@ -131,6 +134,17 @@ impl DxgiCapturer {
             left: coordinates.left,
             top: coordinates.top,
         };
+        if desc.Rotation != DXGI_MODE_ROTATION_IDENTITY
+            && desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED
+        {
+            // La duplication livre l'image dans l'orientation du panneau, pas
+            // dans celle du bureau. La redresser demanderait une passe de
+            // rendu de plus ; mieux vaut le dire que laisser chercher.
+            tracing::warn!(
+                output = output_index,
+                "écran pivoté : l'image sera transmise sans être redressée"
+            );
+        }
 
         let target = create_target_texture(&device, info.width, info.height)?;
         let target_resource: ID3D11Resource = target.cast().map_err(map_hresult)?;

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {
   PROTOCOL, toHex, fromHex, fromBase64, groupHex, transcript,
   event, isLossy, encodeFrame, coalesce, chunk, textToEvents, textDelta, wheelUnits,
-  decodePointer, SeqTracker, contentRect,
+  decodePointer, SeqTracker, contentRect, buttonDelta,
   perUnitDelta, lossPercentDelta, estimateLatency, isStalled,
   reconnectDelay, RECONNECT_DELAYS_MS, MAX_EVENTS_PER_FRAME,
 } from '../core.js';
@@ -169,6 +169,37 @@ test('un brouillon inchangé n’envoie rien', () => {
 test('un émoji compte pour un seul retour arrière', () => {
   assert.deepEqual(textDelta('a\u{1F600}', 'a'), { backspaces: 1, added: '' });
   assert.deepEqual(textDelta('\u{1F600}', '\u{1F601}'), { backspaces: 1, added: '\u{1F601}' });
+});
+
+test('le masque du navigateur donne les boutons à enfoncer et à relâcher', () => {
+  // Bits : 1 gauche, 2 droit, 4 milieu. Protocole : 0 gauche, 1 droit, 2 milieu.
+  assert.deepEqual(buttonDelta(1, new Set()), { press: [0], release: [] });
+  assert.deepEqual(buttonDelta(2, new Set()), { press: [1], release: [] });
+  assert.deepEqual(buttonDelta(4, new Set()), { press: [2], release: [] });
+  assert.deepEqual(buttonDelta(0, new Set([0])), { press: [], release: [0] });
+  assert.deepEqual(buttonDelta(1, new Set([0])), { press: [], release: [] });
+});
+
+test('des boutons combinés ne laissent rien d’enfoncé sur l’hôte', () => {
+  // Gauche, puis droit, puis gauche relâché, puis droit relâché. Le
+  // navigateur n'émet `pointerdown` que pour le premier et `pointerup` que
+  // pour le dernier ; les deux étapes du milieu n'existent que dans le masque.
+  const held = new Set();
+  const apply = (mask) => {
+    const { press, release } = buttonDelta(mask, held);
+    release.forEach((index) => held.delete(index));
+    press.forEach((index) => held.add(index));
+    return { press, release };
+  };
+  assert.deepEqual(apply(1), { press: [0], release: [] });
+  assert.deepEqual(apply(3), { press: [1], release: [] });
+  assert.deepEqual(apply(2), { press: [], release: [0] });
+  assert.deepEqual(apply(0), { press: [], release: [1] });
+  assert.equal(held.size, 0);
+});
+
+test('les boutons latéraux sont transmis', () => {
+  assert.deepEqual(buttonDelta(8 | 16, new Set()), { press: [3, 4], release: [] });
 });
 
 test('un cran de molette vaut 120 unités, vers le haut en positif', () => {

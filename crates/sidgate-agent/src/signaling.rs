@@ -15,8 +15,9 @@
 //! n'approche pas de la session en cours — il n'occupe qu'une place parmi les
 //! poignées de main en attente, qui sont comptées.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -71,6 +72,13 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(180);
 /// Chacune peut rester ouverte jusqu'à [`AUTH_TIMEOUT`] ; sans plafond, il
 /// suffirait d'ouvrir des connexions muettes pour épuiser l'agent.
 const MAX_PENDING_HANDSHAKES: usize = 8;
+/// Poignées de main simultanées tolérées depuis une même adresse.
+///
+/// Un appareil légitime en tient une, deux s'il se reconnecte pendant qu'un
+/// formulaire d'appairage est resté ouvert. Sans ce plafond, une seule machine
+/// du maillage suffirait à occuper toutes les places et à fermer la porte aux
+/// autres.
+const MAX_PENDING_PER_SOURCE: u32 = 2;
 /// Temps laissé à la session en cours pour se retirer devant un remplaçant.
 const TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Période de vérification qu'un client en session n'a pas été révoqué.
@@ -110,6 +118,8 @@ pub struct AppState {
     pub config: Config,
     /// Places disponibles pour les poignées de main non authentifiées.
     handshakes: Semaphore,
+    /// Poignées de main en cours, par adresse d'origine.
+    pending: Mutex<HashMap<IpAddr, u32>>,
     /// L'unique emplacement de session.
     slot: tokio::sync::Mutex<()>,
     /// De quoi demander à la session en cours de se retirer.
@@ -123,8 +133,45 @@ impl AppState {
             identity: Mutex::new(identity),
             config,
             handshakes: Semaphore::new(MAX_PENDING_HANDSHAKES),
+            pending: Mutex::new(HashMap::new()),
             slot: tokio::sync::Mutex::new(()),
             current: Mutex::new(None),
+        }
+    }
+
+    /// Réserve une place de poignée de main pour `peer`, s'il en reste une au
+    /// total et pour cette adresse. La place se libère avec la valeur rendue.
+    fn reserve_handshake(&self, peer: IpAddr) -> Option<HandshakeSlot<'_>> {
+        let permit = self.handshakes.try_acquire().ok()?;
+        let mut pending = self.pending.lock();
+        let count = pending.entry(peer).or_insert(0);
+        if *count >= MAX_PENDING_PER_SOURCE {
+            return None;
+        }
+        *count += 1;
+        Some(HandshakeSlot {
+            state: self,
+            peer,
+            _permit: permit,
+        })
+    }
+}
+
+/// Place occupée par une poignée de main en cours.
+struct HandshakeSlot<'a> {
+    state: &'a AppState,
+    peer: IpAddr,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+}
+
+impl Drop for HandshakeSlot<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.state.pending.lock();
+        if let Some(count) = pending.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pending.remove(&self.peer);
+            }
         }
     }
 }
@@ -289,7 +336,7 @@ async fn run_connection(
 ) -> anyhow::Result<()> {
     let (mut sink, mut stream) = socket.split();
 
-    let Ok(permit) = state.handshakes.try_acquire() else {
+    let Some(permit) = state.reserve_handshake(peer) else {
         tracing::warn!(%peer, "trop de poignées de main en attente, connexion refusée");
         return send(
             &mut sink,
@@ -542,9 +589,13 @@ struct SessionRuntime {
     dispatcher: Mutex<Dispatcher>,
     sink: Mutex<sidgate_input::Sink>,
     pipeline: Mutex<Option<Pipeline>>,
-    /// Sérialise les démarrages du pipeline : la reprise de capture et le
-    /// changement d'écran peuvent le demander au même instant.
+    /// Sérialise les démarrages et arrêts du pipeline : la reprise de capture,
+    /// le changement d'écran et la fermeture peuvent survenir au même instant.
     starting: tokio::sync::Mutex<()>,
+    /// La session se ferme : plus aucun pipeline ne doit démarrer.
+    closed: AtomicBool,
+    /// Tâche qui retente d'ouvrir la capture, s'il y en a une.
+    retry: Mutex<Option<tokio::task::JoinHandle<()>>>,
     seq: Mutex<SeqTracker>,
     control: Mutex<Option<Arc<dyn DataChannel>>>,
     input: Mutex<Option<Arc<dyn DataChannel>>>,
@@ -570,6 +621,8 @@ impl SessionRuntime {
             sink: Mutex::new(sidgate_input::Sink::new()),
             pipeline: Mutex::new(None),
             starting: tokio::sync::Mutex::new(()),
+            closed: AtomicBool::new(false),
+            retry: Mutex::new(None),
             seq: Mutex::new(SeqTracker::new()),
             control: Mutex::new(None),
             input: Mutex::new(None),
@@ -671,12 +724,25 @@ async fn run_session(
     kick: &Notify,
 ) -> anyhow::Result<()> {
     let bind = SocketAddr::new(state.config.network.bind, 0);
-    let (session, mut events) = Session::new(
+    let created = Session::new(
         bind,
         &state.config.network.stun_servers,
         state.config.video.framerate,
     )
-    .await?;
+    .await;
+    let (session, mut events) = match created {
+        Ok(created) => created,
+        Err(e) => {
+            // Ce client vient peut-être de remplacer une session, laquelle
+            // s'est retirée sans verrouiller le poste. S'il ne peut pas
+            // prendre la suite, plus personne ne tient la session : le
+            // killswitch s'applique.
+            if state.config.security.lock_on_disconnect {
+                let _ = sidgate_input::system::lock_session();
+            }
+            return Err(e);
+        }
+    };
     let runtime = Arc::new(SessionRuntime::new(session, state.config.clone()));
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -732,7 +798,7 @@ async fn run_session(
                             if !streaming {
                                 streaming = true;
                                 tasks.push(runtime.session.spawn_feedback_reader());
-                                tasks.extend(start_streaming(&runtime).await);
+                                start_streaming(&runtime).await;
                             }
                         } else if session::is_terminal(connection_state) {
                             tracing::warn!(session = %session_id, ?connection_state, "transport perdu");
@@ -833,27 +899,10 @@ fn is_mdns_candidate(candidate: &str) -> bool {
 /// sécurisé — ne met pas fin à la session : le client reste connecté, en est
 /// informé, et la vidéo démarre dès que la capture redevient possible. Couper
 /// la session dans ce cas obligerait à tout renégocier au déverrouillage.
-async fn start_streaming(runtime: &Arc<SessionRuntime>) -> Option<tokio::task::JoinHandle<()>> {
-    match try_start_pipeline(runtime).await {
-        Ok(()) => None,
-        Err(e) if is_desktop_unavailable(&e) => {
-            tracing::warn!(error = %e, "capture différée");
-            runtime
-                .emit(ControlEvent::CaptureUnavailable {
-                    message: e.to_string(),
-                })
-                .await;
-            Some(spawn_capture_retry(Arc::clone(runtime)))
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "démarrage du pipeline impossible");
-            runtime
-                .emit(ControlEvent::CaptureUnavailable {
-                    message: e.to_string(),
-                })
-                .await;
-            None
-        }
+async fn start_streaming(runtime: &Arc<SessionRuntime>) {
+    let _starting = runtime.starting.lock().await;
+    if let Err(e) = start_pipeline_locked(runtime).await {
+        capture_failed(runtime, &e).await;
     }
 }
 
@@ -863,6 +912,44 @@ fn is_desktop_unavailable(error: &anyhow::Error) -> bool {
         error.downcast_ref::<sidgate_capture::CaptureError>(),
         Some(sidgate_capture::CaptureError::DesktopUnavailable),
     )
+}
+
+/// La sortie vidéo demandée n'existe-t-elle pas, ou plus ?
+fn is_output_missing(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<sidgate_capture::CaptureError>(),
+        Some(sidgate_capture::CaptureError::OutputNotFound(_)),
+    )
+}
+
+/// La capture ne tourne pas : le dit au client, et programme une reprise si la
+/// cause est de celles qui passent.
+async fn capture_failed(runtime: &Arc<SessionRuntime>, error: &anyhow::Error) {
+    let transient = is_desktop_unavailable(error);
+    if transient {
+        tracing::warn!(error = %error, "capture différée");
+        ensure_capture_retry(runtime);
+    } else {
+        tracing::error!(error = %error, "démarrage du pipeline impossible");
+    }
+    runtime
+        .emit(ControlEvent::CaptureUnavailable {
+            message: error.to_string(),
+            transient,
+        })
+        .await;
+}
+
+/// Lance la tâche de reprise de capture, si elle ne tourne pas déjà.
+fn ensure_capture_retry(runtime: &Arc<SessionRuntime>) {
+    if runtime.closed.load(Ordering::Acquire) {
+        return;
+    }
+    let mut retry = runtime.retry.lock();
+    if retry.as_ref().is_some_and(|task| !task.is_finished()) {
+        return;
+    }
+    *retry = Some(spawn_capture_retry(Arc::clone(runtime)));
 }
 
 /// Réessaie d'ouvrir la capture jusqu'à ce que le bureau redevienne accessible.
@@ -881,6 +968,12 @@ fn spawn_capture_retry(runtime: Arc<SessionRuntime>) -> tokio::task::JoinHandle<
                 Err(e) if is_desktop_unavailable(&e) => continue,
                 Err(e) => {
                     tracing::error!(error = %e, "capture définitivement indisponible");
+                    runtime
+                        .emit(ControlEvent::CaptureUnavailable {
+                            message: e.to_string(),
+                            transient: false,
+                        })
+                        .await;
                     return;
                 }
             }
@@ -891,28 +984,53 @@ fn spawn_capture_retry(runtime: Arc<SessionRuntime>) -> tokio::task::JoinHandle<
 /// Tentative unique de démarrage du pipeline. Sans effet s'il tourne déjà.
 async fn try_start_pipeline(runtime: &Arc<SessionRuntime>) -> anyhow::Result<()> {
     let _starting = runtime.starting.lock().await;
+    start_pipeline_locked(runtime).await
+}
+
+/// Démarre le pipeline. À n'appeler qu'en tenant `starting`.
+async fn start_pipeline_locked(runtime: &Arc<SessionRuntime>) -> anyhow::Result<()> {
+    // Vérifié sous le verrou : la fermeture le prend avant d'arrêter le
+    // pipeline, donc rien de ce qui démarre ici ne peut lui échapper.
+    anyhow::ensure!(
+        !runtime.closed.load(Ordering::Acquire),
+        "la session se ferme"
+    );
     if runtime.pipeline.lock().is_some() {
         return Ok(());
     }
 
-    let (frames_tx, frames_rx) = mpsc::channel(crate::pipeline::FRAME_QUEUE_DEPTH);
-    let output = runtime.output.load(Ordering::Relaxed);
     let preset = *runtime.preset.lock();
-    // L'ouverture de la duplication et de l'encodeur prend quelques centaines
-    // de millisecondes d'appels système bloquants.
-    let pipeline = tokio::task::block_in_place(|| {
-        Pipeline::start(
-            &runtime.config.video,
-            output,
-            preset.target_bitrate_1080p(),
-            frames_tx,
-        )
-    })?;
+    let open = |output: u32| {
+        let (frames_tx, frames_rx) = mpsc::channel(crate::pipeline::FRAME_QUEUE_DEPTH);
+        // L'ouverture de la duplication et de l'encodeur prend quelques
+        // centaines de millisecondes d'appels système bloquants.
+        tokio::task::block_in_place(|| {
+            Pipeline::start(
+                &runtime.config.video,
+                output,
+                preset.target_bitrate_1080p(),
+                frames_tx,
+            )
+        })
+        .map(|pipeline| (pipeline, frames_rx))
+    };
+
+    let output = runtime.output.load(Ordering::Relaxed);
+    let (pipeline, frames_rx) = match open(output) {
+        // L'écran configuré ou choisi a été débranché : se rabattre sur le
+        // principal vaut mieux qu'une session sans image ni moyen d'en changer.
+        Err(e) if output != 0 && is_output_missing(&e) => {
+            tracing::warn!(output, "écran introuvable, repli sur le premier");
+            runtime.output.store(0, Ordering::Relaxed);
+            open(0)?
+        }
+        other => other?,
+    };
     let desktop = pipeline.desktop();
     let feedback = pipeline.feedback();
     let stats = Arc::clone(pipeline.stats());
 
-    apply_geometry(runtime, desktop);
+    apply_geometry(runtime, desktop, enumerate_outputs());
     let ceiling = runtime.dispatcher.lock().bitrate_for(preset);
     *runtime.bitrate.lock() = BitrateController::new(ceiling);
     *runtime.pipeline.lock() = Some(pipeline);
@@ -920,8 +1038,8 @@ async fn try_start_pipeline(runtime: &Arc<SessionRuntime>) -> anyhow::Result<()>
     runtime
         .session
         .spawn_video_sender(frames_rx, runtime.config.video.framerate);
-    spawn_stats_reporter(Arc::clone(runtime), stats);
-    spawn_feedback_forwarder(Arc::clone(runtime), feedback);
+    spawn_stats_reporter(Arc::clone(runtime), Arc::clone(&stats));
+    spawn_feedback_forwarder(Arc::clone(runtime), feedback, stats);
 
     announce(runtime).await;
 
@@ -941,20 +1059,30 @@ fn stop_pipeline(runtime: &SessionRuntime) {
     tokio::task::block_in_place(|| drop(pipeline));
 }
 
+/// Liste les sorties vidéo de l'hôte, vide si l'énumération échoue.
+fn enumerate_outputs() -> Vec<OutputInfo> {
+    tokio::task::block_in_place(sidgate_capture::enumerate_outputs).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "énumération des écrans impossible");
+        Vec::new()
+    })
+}
+
 /// Aligne le dispatcher et l'injection d'entrées sur le bureau capturé.
-fn apply_geometry(runtime: &SessionRuntime, desktop: DesktopInfo) {
-    let outputs =
-        tokio::task::block_in_place(sidgate_capture::enumerate_outputs).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "énumération des écrans impossible");
-            Vec::new()
-        });
+fn apply_geometry(runtime: &SessionRuntime, desktop: DesktopInfo, outputs: Vec<OutputInfo>) {
     let rects: Vec<ScreenRect> = outputs.iter().map(output_rect).collect();
-    let target = ScreenRect {
-        left: desktop.left,
-        top: desktop.top,
-        width: desktop.width,
-        height: desktop.height,
-    };
+    // La place de la sortie dans le bureau virtuel se lit dans l'énumération
+    // quand elle y figure : c'est la source la plus fraîche si les écrans
+    // viennent d'être réarrangés.
+    let target = outputs
+        .iter()
+        .find(|output| output.index == desktop.output_index)
+        .map(output_rect)
+        .unwrap_or(ScreenRect {
+            left: desktop.left,
+            top: desktop.top,
+            width: desktop.width,
+            height: desktop.height,
+        });
 
     runtime
         .dispatcher
@@ -965,6 +1093,30 @@ fn apply_geometry(runtime: &SessionRuntime, desktop: DesktopInfo) {
         .lock()
         .set_mapping(Some(AbsoluteMapping::new(target, &rects)));
     *runtime.outputs.lock() = outputs;
+}
+
+/// Reprend la disposition des écrans si elle a changé.
+///
+/// La capture ne signale que ce qui touche la sortie capturée. Qu'un *autre*
+/// écran soit débranché ou déplacé change pourtant le bureau virtuel, donc
+/// l'endroit où tombe un clic : sans cette relecture, la projection des
+/// positions garderait les dimensions d'un bureau qui n'existe plus.
+async fn refresh_outputs(runtime: &SessionRuntime) {
+    let outputs = enumerate_outputs();
+    if outputs.is_empty() || *runtime.outputs.lock() == outputs {
+        return;
+    }
+    let Some(desktop) = runtime
+        .pipeline
+        .lock()
+        .as_ref()
+        .map(|pipeline| pipeline.desktop())
+    else {
+        return;
+    };
+    tracing::info!(displays = outputs.len(), "disposition des écrans changée");
+    apply_geometry(runtime, desktop, outputs);
+    announce(runtime).await;
 }
 
 fn output_rect(output: &OutputInfo) -> ScreenRect {
@@ -983,11 +1135,9 @@ fn output_rect(output: &OutputInfo) -> ScreenRect {
 /// quoi parler ou pas encore à qui. Le client traite l'annonce comme un état,
 /// pas comme un événement : la recevoir deux fois est sans effet.
 async fn announce(runtime: &SessionRuntime) {
-    let Some((desktop, shape, pointer)) = runtime.pipeline.lock().as_ref().map(|pipeline| {
-        let feedback = pipeline.feedback();
-        let shape = feedback.shape.borrow().clone();
-        let pointer = *feedback.pointer.borrow();
-        (pipeline.desktop(), shape, pointer)
+    let Some((desktop, shape)) = runtime.pipeline.lock().as_ref().map(|pipeline| {
+        let shape = pipeline.feedback().shape.borrow().clone();
+        (pipeline.desktop(), shape)
     }) else {
         return;
     };
@@ -1028,7 +1178,22 @@ async fn announce(runtime: &SessionRuntime) {
     if let Some(shape) = shape {
         emit_pointer_shape(runtime, &shape).await;
     }
-    runtime.send_pointer(pointer).await;
+    announce_pointer(runtime).await;
+}
+
+/// Envoie la position courante du curseur, sans attendre qu'il bouge.
+///
+/// Les positions ne sont publiées qu'à leur changement : un client qui arrive
+/// devant un curseur immobile ne saurait pas où le dessiner.
+async fn announce_pointer(runtime: &SessionRuntime) {
+    let pointer = runtime
+        .pipeline
+        .lock()
+        .as_ref()
+        .map(|pipeline| *pipeline.feedback().pointer.borrow());
+    if let Some(pointer) = pointer {
+        runtime.send_pointer(pointer).await;
+    }
 }
 
 /// Transmet une forme de curseur, si elle tient dans un message.
@@ -1055,10 +1220,12 @@ async fn emit_pointer_shape(runtime: &SessionRuntime, shape: &PointerShape) {
 /// Relaie vers le client ce que le thread de capture publie hors vidéo.
 ///
 /// La tâche vit aussi longtemps que le pipeline dont elle écoute les
-/// publications, et s'arrête avec lui.
+/// publications. Quand elles cessent, le thread de capture s'est arrêté : si
+/// personne ne le lui a demandé, c'est une panne, et la capture est relancée.
 fn spawn_feedback_forwarder(
     runtime: Arc<SessionRuntime>,
     mut feedback: PipelineFeedback,
+    stats: Arc<PipelineStats>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1085,12 +1252,36 @@ fn spawn_feedback_forwarder(
                 }
             }
         }
+        on_pipeline_ended(&runtime, &stats).await;
     })
+}
+
+/// Le thread de capture d'un pipeline s'est arrêté.
+///
+/// Arrêté par nous — changement d'écran, fermeture — le pipeline a déjà quitté
+/// l'état de session et il n'y a rien à faire. S'il y figure encore, il est
+/// tombé seul : erreur de l'encodeur, pilote graphique réinitialisé. Le laisser
+/// en place figerait l'image jusqu'à la fin de la session, tout en faisant
+/// croire au reste de l'agent que la capture tourne.
+async fn on_pipeline_ended(runtime: &Arc<SessionRuntime>, stats: &Arc<PipelineStats>) {
+    let _starting = runtime.starting.lock().await;
+    if runtime.closed.load(Ordering::Acquire) || !runtime.owns(stats) {
+        return;
+    }
+    tracing::error!("le pipeline de capture s'est arrêté de lui-même, relance");
+    stop_pipeline(runtime);
+    ensure_capture_retry(runtime);
+    runtime
+        .emit(ControlEvent::CaptureUnavailable {
+            message: "la capture s'est interrompue".into(),
+            transient: true,
+        })
+        .await;
 }
 
 /// La résolution de la sortie capturée a changé en cours de session.
 async fn on_display_changed(runtime: &SessionRuntime, desktop: DesktopInfo) {
-    apply_geometry(runtime, desktop);
+    apply_geometry(runtime, desktop, enumerate_outputs());
 
     // Le palier choisi vaut pour une surface : la nouvelle a un autre plafond.
     let preset = *runtime.preset.lock();
@@ -1121,8 +1312,16 @@ async fn teardown(
     session_id: &str,
     reason: EndReason,
 ) {
+    // D'abord interdire tout nouveau démarrage, ensuite seulement arrêter ce
+    // qui tourne : dans l'autre ordre, un démarrage en cours — changement
+    // d'écran, reprise de capture — s'achèverait après l'arrêt et laisserait
+    // derrière lui un pipeline que plus personne ne détient.
+    runtime.closed.store(true, Ordering::Release);
     for task in tasks {
         task.abort();
+    }
+    if let Some(retry) = runtime.retry.lock().take() {
+        retry.abort();
     }
 
     // Relâcher avant de verrouiller : une touche restée enfoncée survivrait au
@@ -1132,8 +1331,12 @@ async fn teardown(
     }
 
     // Le pipeline part ici, ce qui rend la VRAM, arrête le thread de capture et
-    // ramène l'agent à sa consommation de repos.
-    stop_pipeline(runtime);
+    // ramène l'agent à sa consommation de repos. Le verrou attend la fin d'un
+    // démarrage déjà engagé.
+    {
+        let _starting = runtime.starting.lock().await;
+        stop_pipeline(runtime);
+    }
     *runtime.control.lock() = None;
     *runtime.input.lock() = None;
     runtime.session.close().await;
@@ -1164,13 +1367,15 @@ fn spawn_channel(
         }
         tracing::info!(%label, "canal de données ouvert");
 
+        // Le pipeline a pu démarrer avant ce canal : lui redire où il en est,
+        // chacun pour ce qu'il transporte.
         if is_control {
             *runtime.control.lock() = Some(Arc::clone(&channel));
+            announce(&runtime).await;
         } else {
             *runtime.input.lock() = Some(Arc::clone(&channel));
+            announce_pointer(&runtime).await;
         }
-        // Le pipeline a pu démarrer avant ce canal : lui redire où il en est.
-        announce(&runtime).await;
 
         while let Some(event) = channel.poll().await {
             match event {
@@ -1325,6 +1530,10 @@ async fn apply(effect: Effect, runtime: &Arc<SessionRuntime>) -> Result<(), Reje
 /// la demande — la capture revient à la précédente plutôt que de laisser le
 /// client devant une image figée.
 async fn select_display(runtime: &Arc<SessionRuntime>, index: u32) -> Result<(), RejectReason> {
+    // Arrêt et redémarrage d'un seul tenant : une reprise de capture qui
+    // s'intercalerait rouvrirait l'ancien écran sous le nouveau numéro.
+    let _starting = runtime.starting.lock().await;
+
     let previous = runtime.output.swap(index, Ordering::Relaxed);
     if previous == index && runtime.pipeline.lock().is_some() {
         return Ok(());
@@ -1336,19 +1545,19 @@ async fn select_display(runtime: &Arc<SessionRuntime>, index: u32) -> Result<(),
     }
     stop_pipeline(runtime);
 
-    match try_start_pipeline(runtime).await {
+    match start_pipeline_locked(runtime).await {
         Ok(()) => Ok(()),
         Err(e) if is_desktop_unavailable(&e) => {
             // La session hôte est verrouillée : la reprise de capture ouvrira
             // la sortie demandée dès que le bureau reviendra.
-            tracing::warn!(output = index, "écran sélectionné, capture différée");
+            capture_failed(runtime, &e).await;
             Ok(())
         }
         Err(e) => {
             tracing::warn!(output = index, error = %e, "écran inaccessible, retour au précédent");
             runtime.output.store(previous, Ordering::Relaxed);
-            if let Err(e) = try_start_pipeline(runtime).await {
-                tracing::error!(error = %e, "reprise de la capture impossible");
+            if let Err(e) = start_pipeline_locked(runtime).await {
+                capture_failed(runtime, &e).await;
             }
             Err(RejectReason::Failed)
         }
@@ -1425,6 +1634,8 @@ fn spawn_stats_reporter(
             let report = stats_from(&delta, elapsed, meter.sample(), rtt_ms);
             *runtime.last_stats.lock() = Some(report);
             runtime.emit(ControlEvent::Stats(report)).await;
+
+            refresh_outputs(&runtime).await;
         }
     })
 }
@@ -1531,6 +1742,62 @@ mod tests {
         // la refuser, la pile ICE s'en charge.
         assert!(!is_mdns_candidate("candidate:1 1 udp"));
         assert!(!is_mdns_candidate(""));
+    }
+
+    fn state() -> AppState {
+        let dir = std::env::temp_dir().join(format!(
+            "sidgate-signaling-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let identity = Identity::load_or_create(&dir, 10).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        AppState::new(identity, Config::default())
+    }
+
+    fn address(last: u8) -> IpAddr {
+        IpAddr::from([100, 64, 0, last])
+    }
+
+    #[test]
+    fn one_source_cannot_hold_every_handshake_slot() {
+        let state = state();
+        let held: Vec<_> = (0..MAX_PENDING_PER_SOURCE)
+            .map(|_| state.reserve_handshake(address(1)).expect("place libre"))
+            .collect();
+        assert!(
+            state.reserve_handshake(address(1)).is_none(),
+            "au-delà de son quota, une adresse est refusée"
+        );
+        assert!(
+            state.reserve_handshake(address(2)).is_some(),
+            "sans que cela ferme la porte aux autres"
+        );
+
+        drop(held);
+        assert!(
+            state.reserve_handshake(address(1)).is_some(),
+            "une place rendue se reprend"
+        );
+        assert!(
+            state.pending.lock().is_empty(),
+            "et le compte ne garde aucune adresse inactive"
+        );
+    }
+
+    #[test]
+    fn the_global_handshake_limit_still_applies() {
+        let state = state();
+        let held: Vec<_> = (0..MAX_PENDING_HANDSHAKES as u8)
+            .filter_map(|n| state.reserve_handshake(address(n)))
+            .collect();
+        assert_eq!(held.len(), MAX_PENDING_HANDSHAKES);
+        assert!(state.reserve_handshake(address(200)).is_none());
+        assert!(
+            !state.pending.lock().contains_key(&address(200)),
+            "un refus ne laisse pas de trace dans le compte"
+        );
     }
 
     #[test]

@@ -31,6 +31,12 @@ la poignée de main et invité à recharger.
 - **La fin d'un geste rapide n'était pas affichée.** L'image en avance sur la
   cadence était écartée, et si rien d'autre ne bougeait ensuite, le client
   restait sur l'image d'avant.
+- **Une image isolée arrivait avec un dixième de seconde de retard.** Une fois
+  soumise à l'encodeur, sa sortie n'était relevée qu'à l'image suivante du
+  bureau : sur un écran par ailleurs immobile, l'écho d'une frappe attendait.
+- **Deux boutons de souris pressés ensemble en laissaient un enfoncé.** Le
+  navigateur ne signale que le premier appui et le dernier relâchement ; les
+  boutons se lisent maintenant dans le masque de chaque événement.
 - **Une erreur de négociation laissait la capture tourner**, sans verrouiller le
   poste : la fermeture de session passe par un chemin unique.
 - **Une révocation n'atteignait pas un agent en marche** avant son redémarrage.
@@ -61,6 +67,11 @@ la poignée de main et invité à recharger.
 - Gestes tactiles : appui long, toucher et défilement à deux doigts, glisser par
   double toucher. Modificatrices à bascule.
 - Reconnexion automatique après une coupure subie.
+- Relance de la capture quand elle s'arrête d'elle-même — pilote graphique
+  réinitialisé — et repli sur le premier écran si celui demandé a disparu.
+- Suivi des écrans branchés, débranchés ou déplacés en cours de session.
+- Un appareil révoqué peut oublier l'hôte et s'appairer de nouveau depuis
+  l'écran d'accueil.
 - Journal sur disque pour le travailleur lancé par le service.
 - Icônes d'application, mise en page pour téléphone tenu debout, panneau de
   détails de la télémétrie.

@@ -163,8 +163,8 @@ fn run(
     if acl::exposure(&dir) == acl::Exposure::Shared {
         tracing::warn!(
             path = %dir.display(),
-            "le répertoire de données est accessible aux autres comptes de cette machine ; \
-             « sidgate protect » le ferme"
+            "le répertoire de données est accessible à un autre compte que le système, les \
+             administrateurs et celui de l'agent ; « sidgate protect » le ferme"
         );
     }
 
@@ -251,12 +251,12 @@ fn print_pairing_code(code: &str, ttl: Duration) {
 /// réseau, et pouvoir écrire dans ce répertoire est précisément ce qui prouve
 /// que la demande vient de la machine elle-même.
 fn pair(dir: std::path::PathBuf, config: Config) -> anyhow::Result<()> {
-    let known: Vec<String> =
-        Identity::load_or_create(&dir, config.security.auth_attempts_per_minute)?
-            .clients()
-            .iter()
-            .map(|client| client.key.clone())
-            .collect();
+    // Vérifie au passage que l'identité et le registre sont lisibles.
+    Identity::load_or_create(&dir, config.security.auth_attempts_per_minute)?;
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     let address = std::net::SocketAddr::new(config.network.bind, config.network.port);
     if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(400)).is_err() {
@@ -274,7 +274,7 @@ fn pair(dir: std::path::PathBuf, config: Config) -> anyhow::Result<()> {
         .build()?;
     let outcome = runtime.block_on(async {
         tokio::select! {
-            outcome = wait_for_pairing(&dir, &config, &known, ttl) => outcome,
+            outcome = wait_for_pairing(&dir, &config, since, ttl) => outcome,
             _ = tokio::signal::ctrl_c() => PairingOutcome::Cancelled,
         }
     });
@@ -299,24 +299,29 @@ enum PairingOutcome {
 async fn wait_for_pairing(
     dir: &std::path::Path,
     config: &Config,
-    known: &[String],
+    since: u64,
     ttl: Duration,
 ) -> PairingOutcome {
     let deadline = Instant::now() + ttl;
+    // Un appareil appairé depuis le dépôt de la demande. La date, et non la
+    // nouveauté de la clé : un appareil déjà connu peut s'appairer de nouveau.
     let newcomer = || {
         Identity::load_or_create(dir, config.security.auth_attempts_per_minute)
             .ok()?
             .clients()
             .iter()
-            .find(|client| !known.contains(&client.key))
+            .find(|client| client.paired_at >= since)
             .map(|client| client.label.clone())
     };
 
     while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(label) = newcomer() {
+            return PairingOutcome::Paired(label);
+        }
         if !identity::pairing_ticket_pending(dir) {
-            // Consommée : l'agent a inscrit le client juste avant de l'effacer.
-            return newcomer().map_or(PairingOutcome::Expired, PairingOutcome::Paired);
+            // Demande disparue sans client inscrit : expirée ou retirée.
+            return PairingOutcome::Expired;
         }
     }
     newcomer().map_or(PairingOutcome::Expired, PairingOutcome::Paired)
@@ -325,8 +330,14 @@ async fn wait_for_pairing(
 /// Ferme le répertoire de données aux autres comptes de la machine.
 fn protect(dir: std::path::PathBuf) -> anyhow::Result<()> {
     acl::restrict(&dir)?;
+    // Une demande d'appairage déposée avant la fermeture a pu l'être par
+    // n'importe qui : elle ne doit pas lui survivre.
+    if identity::clear_pairing_ticket(&dir) {
+        println!("une demande d'appairage en attente a été retirée.");
+    }
     println!("répertoire fermé aux autres comptes : {}", dir.display());
-    println!("y accèdent désormais le système, les administrateurs et le compte courant.");
+    println!("y accèdent désormais le système, les administrateurs et le compte courant,");
+    println!("qui en est propriétaire. Vérifiez la liste des appareils : sidgate clients");
     Ok(())
 }
 
@@ -362,7 +373,7 @@ fn info(dir: std::path::PathBuf, config: Config) -> anyhow::Result<()> {
         match acl::exposure(&dir) {
             acl::Exposure::Private => "réservé au système, aux administrateurs et à son compte",
             acl::Exposure::Shared =>
-                "OUVERT aux autres comptes — fermez-le avec « sidgate protect »",
+                "OUVERT à un autre compte — fermez-le avec « sidgate protect »",
             acl::Exposure::Unknown => "indéterminé",
         }
     );

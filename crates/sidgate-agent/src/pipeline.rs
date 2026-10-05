@@ -136,6 +136,17 @@ impl KeyframeGate {
     }
 }
 
+/// Temps laissé à l'encodeur pour rendre une image soumise avant de cesser de
+/// le sonder de près.
+///
+/// Un encodeur matériel rend sa sortie en quelques millisecondes. S'il ne l'a
+/// pas fait au bout de ce délai, c'est qu'il retient l'image — certains en
+/// gardent une d'avance — et le sonder mille fois par seconde sur un bureau
+/// immobile coûterait le processeur que tout le reste économise.
+const OUTPUT_PATIENCE: Duration = Duration::from_millis(60);
+/// Pas de sondage de l'encodeur tant qu'une sortie est attendue.
+const OUTPUT_POLL: Duration = Duration::from_millis(1);
+
 /// Ordres adressés au thread de capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineCommand {
@@ -328,11 +339,23 @@ fn run(
     let mut owed = false;
     // La texture a-t-elle déjà reçu une image depuis l'ouverture du capteur ?
     let mut has_frame = false;
+    // La dernière image capturée attend-elle encore d'être encodée ? Si une
+    // autre la remplace avant, elle est perdue — et comptée comme telle.
+    let mut unsent = false;
+    // Images soumises dont l'encodeur n'a pas encore rendu la sortie.
+    let mut in_flight = 0u32;
 
     while drain_commands(&commands, &mut engine, &mut bitrate_override, &mut owed)
         == ControlFlow::Continue
     {
-        let timeout = acquire_timeout(owed && has_frame, last_submit.elapsed(), frame_interval);
+        let since_submit = last_submit.elapsed();
+        let mut timeout = acquire_timeout(owed && has_frame, since_submit, frame_interval);
+        if in_flight > 0 && since_submit < OUTPUT_PATIENCE {
+            // L'encodeur travaille : revenir le voir tout de suite. Attendre
+            // la prochaine image du bureau retiendrait celle-ci jusqu'à un
+            // dixième de seconde sur un écran qui ne bouge plus.
+            timeout = OUTPUT_POLL;
+        }
         let acquired = engine.capturer.acquire(timeout);
         // Le curseur bouge aussi quand aucun pixel ne change : il se publie
         // quel que soit le résultat de l'acquisition.
@@ -341,7 +364,12 @@ fn run(
         let fresh = match acquired {
             Ok(FrameStatus::Ready { .. }) => {
                 stats.captured.fetch_add(1, Ordering::Relaxed);
+                if unsent {
+                    // La précédente n'a jamais atteint l'encodeur.
+                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                }
                 has_frame = true;
+                unsent = true;
                 true
             }
             Ok(FrameStatus::Idle) => {
@@ -366,6 +394,8 @@ fn run(
                         // Texture neuve, encore vide : plus rien n'est dû.
                         owed = false;
                         has_frame = false;
+                        unsent = false;
+                        in_flight = 0;
                         feedback.publish_desktop(engine.capturer.desktop());
                     }
                     Err(e) => {
@@ -390,15 +420,16 @@ fn run(
                 Ok(Submission::Accepted) => {
                     last_submit = Instant::now();
                     owed = false;
+                    unsent = false;
+                    in_flight += 1;
                     stats.submitted.fetch_add(1, Ordering::Relaxed);
                     stats
                         .encode_us
                         .fetch_add(mark.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
-                Ok(Submission::Busy) => {
-                    owed = true;
-                    stats.dropped.fetch_add(1, Ordering::Relaxed);
-                }
+                // Encodeur occupé : l'image reste due, et ne sera comptée
+                // perdue que si une autre la remplace entre-temps.
+                Ok(Submission::Busy) => owed = true,
                 Err(e) => {
                     tracing::error!(error = %e, "encodage interrompu");
                     break;
@@ -410,7 +441,6 @@ fn run(
                 // conversion maintenant, mais elle reste due si aucune autre
                 // ne vient la remplacer.
                 owed = true;
-                stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
             if let Err(e) = engine.encoder.poll(&mut encoded) {
                 tracing::error!(error = %e, "drainage de l'encodeur interrompu");
@@ -419,6 +449,7 @@ fn run(
         }
 
         for frame in encoded.drain(..) {
+            in_flight = in_flight.saturating_sub(1);
             stats.encoded.fetch_add(1, Ordering::Relaxed);
             let keyframe = frame.keyframe;
             if !gate.admit(keyframe) {

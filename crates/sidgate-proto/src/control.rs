@@ -236,6 +236,9 @@ pub enum ControlEvent {
     CaptureUnavailable {
         /// Explication destinée à l'utilisateur.
         message: String,
+        /// L'agent retente-t-il de lui-même ? Faux quand la cause ne passera
+        /// pas toute seule — pas d'encodeur matériel, par exemple.
+        transient: bool,
     },
     /// La capture a repris après une interruption.
     CaptureResumed,

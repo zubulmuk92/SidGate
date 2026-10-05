@@ -157,6 +157,11 @@ impl Config {
             "une fenêtre d'appairage de moins de 10 secondes est inutilisable"
         );
         anyhow::ensure!(
+            self.security.pairing_window_secs <= crate::identity::MAX_PAIRING_WINDOW_SECS,
+            "une fenêtre d'appairage ne peut dépasser {} secondes",
+            crate::identity::MAX_PAIRING_WINDOW_SECS
+        );
+        anyhow::ensure!(
             self.network.tls || self.network.bind.is_loopback(),
             "servir en clair n'est autorisé que sur la boucle locale ; sur {} un \
              navigateur refuserait WebRTC faute de contexte sécurisé",
@@ -280,6 +285,10 @@ mod tests {
         let mut config = Config::default();
         config.security.pairing_window_secs = 1;
         assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.security.pairing_window_secs = 86_400;
+        assert!(config.validate().is_err(), "un code valable un jour entier");
     }
 
     #[test]

@@ -17,6 +17,7 @@ import {
   PROTOCOL, NONCE_LEN, DOMAIN_AUTH, DOMAIN_PAIR, DOMAIN_AGENT, MAX_EVENTS_PER_FRAME,
   toHex, fromHex, fromBase64, groupHex, transcript,
   event as input, encodeFrame, coalesce, chunk, textToEvents, textDelta, wheelUnits,
+  buttonDelta,
   decodePointer, SeqTracker, contentRect,
   perUnitDelta, lossPercentDelta, estimateLatency, isStalled, reconnectDelay,
 } from '/core.js';
@@ -27,7 +28,7 @@ const $ = (id) => document.getElementById(id);
 const ui = {
   gate: $('gate'), status: $('status'), unlock: $('unlock'), cancel: $('cancel'),
   pairing: $('pairing'), code: $('code'), pair: $('pair'),
-  trust: $('trust'), forget: $('forget'),
+  trust: $('trust'), trustText: $('trust-text'), forget: $('forget'),
   deviceFingerprint: $('device-fingerprint'), hostFingerprint: $('host-fingerprint'),
   options: $('options'), biometrics: $('biometrics'),
   stage: $('stage'), video: $('screen'), cursor: $('cursor'),
@@ -225,6 +226,8 @@ const state = {
   retryTimer: null,
   /** Motif de fin annoncé par l'agent ou choisi par l'utilisateur. */
   cause: null,
+  /** Cette tentative a-t-elle présenté une identité déjà appairée ? */
+  presentedIdentity: false,
   caps: null,
   desktop: { width: 1920, height: 1080 },
   absolute: matchMedia('(pointer: fine)').matches,
@@ -292,6 +295,7 @@ async function connect() {
   state.retryTimer = null;
   const run = ++state.run;
   state.cause = null;
+  state.presentedIdentity = false;
   ui.unlock.hidden = true;
   ui.cancel.hidden = false;
   ui.pairing.hidden = true;
@@ -363,7 +367,9 @@ async function onChallenge(payload) {
   if (pinned && pinned !== payload.agent_key) {
     // L'agent auquel nous avons été appairés n'est pas celui qui répond.
     finish('refused', 'L’identité de l’hôte a changé. Connexion interrompue par précaution.');
-    ui.trust.hidden = false;
+    offerToForget('Si l’hôte a été réinstallé, oubliez son ancienne identité puis appairez de '
+      + 'nouveau. Dans le doute, n’en faites rien : c’est aussi ce que verrait la victime '
+      + 'd’une interception.');
     return;
   }
 
@@ -371,6 +377,7 @@ async function onChallenge(payload) {
     const data = transcript(
       DOMAIN_AUTH, state.serverNonce, state.clientNonce, state.identity.publicKey,
     );
+    state.presentedIdentity = true;
     send('authenticate', {
       protocol: PROTOCOL,
       client_key: state.identity.publicKeyHex,
@@ -440,7 +447,23 @@ function onAuthFailed({ reason }) {
     protocol_mismatch: 'Cette page ne correspond pas à la version de l’hôte. Rechargez-la.',
     unexpected_message: 'Échange inattendu.',
   };
-  finish('refused', messages[reason] ?? 'Authentification refusée.');
+  // Refusé alors que nous présentions une identité déjà appairée : l'hôte ne
+  // nous connaît plus. Tant que cet appareil garde l'hôte en mémoire, il ne
+  // se verra jamais proposer d'appairage — il faut lui offrir d'en sortir.
+  const forgotten = reason === 'rejected' && state.presentedIdentity;
+  finish('refused', forgotten
+    ? 'L’hôte ne reconnaît plus cet appareil.'
+    : messages[reason] ?? 'Authentification refusée.');
+  if (forgotten) {
+    offerToForget('Il a pu être révoqué. Pour l’appairer de nouveau, oubliez l’hôte, puis '
+      + 'reconnectez-vous pendant qu’un appairage y est ouvert.');
+  }
+}
+
+/** Propose d'oublier l'hôte épinglé, avec l'explication qui convient au cas. */
+function offerToForget(explanation) {
+  ui.trustText.textContent = explanation;
+  ui.trust.hidden = false;
 }
 
 function onClosed({ reason }) {
@@ -551,11 +574,13 @@ function beginSession() {
  */
 function finish(cause, message) {
   const wasLive = state.live;
+  // Tant que la session est encore tenue pour ouverte : après, plus rien ne
+  // part. Si le canal est déjà tombé, l'agent relâche de son côté.
+  releaseEverything();
   state.run += 1;
   state.live = false;
   clearInterval(state.statsTimer);
   state.statsTimer = null;
-  releaseEverything();
 
   const socket = state.socket;
   state.socket = null;
@@ -567,6 +592,7 @@ function finish(cause, message) {
   state.caps = null;
   state.pending = [];
 
+  resetPointers();
   if (document.pointerLockElement) document.exitPointerLock();
   state.wakeLock?.release().catch(() => {});
   state.wakeLock = null;
@@ -746,7 +772,11 @@ function renderDetails(latency) {
 
 function command(cmd, args) {
   if (state.control?.readyState !== 'open') return;
-  state.control.send(JSON.stringify(args === undefined ? { cmd } : { cmd, args }));
+  try {
+    state.control.send(JSON.stringify(args === undefined ? { cmd } : { cmd, args }));
+  } catch {
+    // Canal en cours de fermeture : la commande n'a plus de destinataire.
+  }
 }
 
 function handleControlEvent(message) {
@@ -760,12 +790,17 @@ function handleControlEvent(message) {
     case 'command_rejected':
       toast(rejection(message.command, message.reason));
       break;
-    case 'capture_unavailable':
-      // La session reste ouverte : seule la vidéo manque, et elle revient
-      // d'elle-même. Fermer la connexion obligerait à tout renégocier.
-      ui.notice.textContent = `${message.message}. La vidéo reprendra d’elle-même.`;
+    case 'capture_unavailable': {
+      // La session reste ouverte : seule la vidéo manque. Si la cause est
+      // passagère — poste verrouillé — elle revient d'elle-même, et fermer la
+      // connexion obligerait à tout renégocier.
+      const reason = String(message.message);
+      const sentence = `${reason.charAt(0).toUpperCase()}${reason.slice(1)}.`;
+      ui.notice.textContent = message.transient
+        ? `${sentence} La vidéo reprendra d’elle-même.` : sentence;
       ui.notice.hidden = false;
       break;
+    }
     case 'capture_resumed':
       ui.notice.hidden = true;
       break;
@@ -954,7 +989,12 @@ function sendReliable(events) {
   if (!canSend() || state.control?.readyState !== 'open') return;
   flushLossy();
   for (const part of chunk(events, MAX_EVENTS_PER_FRAME)) {
-    state.control.send(encodeFrame(state.seqReliable, part));
+    try {
+      state.control.send(encodeFrame(state.seqReliable, part));
+    } catch {
+      // Canal en cours de fermeture : l'agent relâche tout à la fin de session.
+      return;
+    }
     state.seqReliable = (state.seqReliable + 1) >>> 0;
   }
 }
@@ -987,7 +1027,10 @@ function releaseEverything() {
   }
   state.sticky.clear();
   renderSticky();
-  if (gesture?.dragging) events.push(input.button(0, false));
+  if (gesture?.dragging) {
+    gesture.dragging = false;
+    events.push(input.button(0, false));
+  }
   for (const index of mouseButtons) events.push(input.button(index, false));
   mouseButtons.clear();
   if (events.length) sendReliable(events);
@@ -1130,7 +1173,6 @@ function normalized(pointerEvent) {
   return { x, y };
 }
 
-const mouseButton = (index) => ({ 0: 0, 2: 1, 1: 2, 3: 3, 4: 4 })[index] ?? 0;
 const pointerLocked = () => document.pointerLockElement === ui.video;
 
 function notePointerType(type) {
@@ -1140,44 +1182,76 @@ function notePointerType(type) {
 }
 
 // Souris et stylet.
+//
+// Un seul traitement pour l'appui, le mouvement et le relâchement : les
+// boutons se lisent dans le masque de chaque événement, pas dans son type.
 
-function onMouseDown(pointerEvent) {
-  ui.video.setPointerCapture(pointerEvent.pointerId);
-  const index = mouseButton(pointerEvent.button);
+/** Le clic en cours a servi à capturer la souris : il ne va pas à l'hôte. */
+let swallowClick = false;
 
+/**
+ * Aligne les boutons tenus sur l'hôte sur ceux que rapporte le navigateur.
+ * @param {boolean} allowPress  Faux hors de l'image : on y relâche, on n'y
+ *   appuie pas.
+ */
+function buttonEvents(pointerEvent, allowPress) {
+  const { press, release } = buttonDelta(pointerEvent.buttons, mouseButtons);
+  const events = [];
+  for (const index of release) {
+    mouseButtons.delete(index);
+    events.push(input.button(index, false));
+  }
+  if (allowPress) {
+    for (const index of press) {
+      mouseButtons.add(index);
+      events.push(input.button(index, true));
+    }
+  }
+  return events;
+}
+
+function onMouse(pointerEvent) {
   if (state.absolute) {
+    if (pointerEvent.type === 'pointerdown') {
+      // Garde les événements quand le pointeur sort de l'image, bouton tenu.
+      try {
+        ui.video.setPointerCapture(pointerEvent.pointerId);
+      } catch {
+        // Refusé si le pointeur est déjà capturé autrement : sans conséquence.
+      }
+    }
     const at = normalized(pointerEvent);
-    if (!at) return;
-    mouseButtons.add(index);
-    sendReliable([input.moveAbsolute(at.x, at.y), input.button(index, true)]);
+    const move = at ? input.moveAbsolute(at.x, at.y) : null;
+    const buttons = buttonEvents(pointerEvent, at !== null);
+    if (buttons.length) {
+      // La position accompagne le clic sur le canal fiable : il doit tomber
+      // là où il a été fait, même si le dernier mouvement s'est perdu.
+      sendReliable(move ? [move, ...buttons] : buttons);
+    } else if (move) {
+      queueLossy(move);
+    }
     return;
   }
+
   // Mode trackpad à la souris : il faut capturer le pointeur pour recevoir des
   // déplacements sans borne. Le premier clic sert à cela, et à rien d'autre.
   if (!pointerLocked()) {
-    ui.video.requestPointerLock?.();
+    if (pointerEvent.type === 'pointerdown') {
+      swallowClick = true;
+      ui.video.requestPointerLock?.();
+    }
     return;
   }
-  mouseButtons.add(index);
-  sendReliable([input.button(index, true)]);
-}
-
-function onMouseMove(pointerEvent) {
-  if (state.absolute) {
-    const at = normalized(pointerEvent);
-    if (at) queueLossy(input.moveAbsolute(at.x, at.y));
-  } else if (pointerLocked()) {
+  if (pointerEvent.type === 'pointermove'
+      && (pointerEvent.movementX || pointerEvent.movementY)) {
     queueLossy(input.moveRelative(pointerEvent.movementX, pointerEvent.movementY));
   }
-}
-
-function onMouseUp(pointerEvent) {
-  const index = mouseButton(pointerEvent.button);
-  if (!mouseButtons.delete(index)) return;
-  const events = [input.button(index, false)];
-  const at = state.absolute ? normalized(pointerEvent) : null;
-  if (at) events.unshift(input.moveAbsolute(at.x, at.y));
-  sendReliable(events);
+  if (swallowClick) {
+    if (pointerEvent.buttons === 0) swallowClick = false;
+    return;
+  }
+  const buttons = buttonEvents(pointerEvent, true);
+  if (buttons.length) sendReliable(buttons);
 }
 
 // Tactile.
@@ -1308,22 +1382,33 @@ ui.video.addEventListener('pointerdown', (pointerEvent) => {
   if (!state.live) return;
   notePointerType(pointerEvent.pointerType);
   if (pointerEvent.pointerType === 'touch') onTouchDown(pointerEvent);
-  else onMouseDown(pointerEvent);
+  else onMouse(pointerEvent);
 });
 
 ui.video.addEventListener('pointermove', (pointerEvent) => {
   if (!state.live) return;
   notePointerType(pointerEvent.pointerType);
   if (pointerEvent.pointerType === 'touch') onTouchMove(pointerEvent);
-  else onMouseMove(pointerEvent);
+  else onMouse(pointerEvent);
 });
 
 for (const type of ['pointerup', 'pointercancel']) {
   ui.video.addEventListener(type, (pointerEvent) => {
     if (!state.live) return;
     if (pointerEvent.pointerType === 'touch') onTouchUp(pointerEvent);
-    else onMouseUp(pointerEvent);
+    else onMouse(pointerEvent);
   });
+}
+
+/** Oublie tout geste en cours : à la fin d'une session, plus rien n'est tenu. */
+function resetPointers() {
+  clearTimeout(gesture?.timer);
+  gesture = null;
+  touches.clear();
+  mouseButtons.clear();
+  swallowClick = false;
+  wheelCarry.x = 0;
+  wheelCarry.y = 0;
 }
 
 ui.video.addEventListener('wheel', (wheelEvent) => {
@@ -1345,10 +1430,12 @@ ui.video.addEventListener('touchstart', (touchEvent) => touchEvent.preventDefaul
   { passive: false });
 ui.video.addEventListener('contextmenu', (mouseEvent) => mouseEvent.preventDefault());
 document.addEventListener('pointerlockchange', () => {
-  if (!pointerLocked()) {
-    for (const index of mouseButtons) sendReliable([input.button(index, false)]);
-    mouseButtons.clear();
-  }
+  if (pointerLocked()) return;
+  // Capture perdue — Échap, changement de fenêtre — boutons encore tenus.
+  const released = [...mouseButtons].map((index) => input.button(index, false));
+  mouseButtons.clear();
+  swallowClick = false;
+  if (released.length) sendReliable(released);
 });
 
 // --- Clavier ----------------------------------------------------------------
@@ -1364,11 +1451,17 @@ window.addEventListener('keydown', (keyboardEvent) => {
   const mapped = scancodeOf(keyboardEvent);
   if (!mapped) return;
   keyboardEvent.preventDefault();
-  if (keyboardEvent.code) state.held.add(keyboardEvent.code);
-  sendReliable([input.key(mapped.scancode, true, mapped.extended)]);
-  // Clavier virtuel : pas de relâchement à attendre, on le fait nous-mêmes.
-  if (!keyboardEvent.code) {
-    sendReliable([input.key(mapped.scancode, false, mapped.extended)]);
+  // Une touche n'est « tenue » que si son relâchement saura la retrouver,
+  // c'est-à-dire si son code physique se traduit. Un clavier virtuel donne un
+  // code vide ou « Unidentified » : la touche est alors frappée d'un coup.
+  if (toScancode(keyboardEvent.code)) {
+    state.held.add(keyboardEvent.code);
+    sendReliable([input.key(mapped.scancode, true, mapped.extended)]);
+  } else {
+    sendReliable([
+      input.key(mapped.scancode, true, mapped.extended),
+      input.key(mapped.scancode, false, mapped.extended),
+    ]);
     releaseSticky();
   }
 });
@@ -1619,7 +1712,7 @@ ui.clipClose.onclick = () => ui.clip.close();
 
 ui.forget.onclick = async () => {
   const confirmed = await confirmAction(
-    'Oublier l’hôte précédent ?',
+    'Oublier cet hôte ?',
     'Cet appareil devra être appairé de nouveau, avec un code lu sur l’hôte.',
     'Oublier',
   );

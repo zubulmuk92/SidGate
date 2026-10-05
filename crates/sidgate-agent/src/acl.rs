@@ -14,6 +14,15 @@
 //! n'hérite plus de rien — réduite à trois entrées : le système, les
 //! administrateurs, et le compte qui l'a créé.
 //!
+//! # Ce que « fermé » veut dire
+//!
+//! Un répertoire n'est tenu pour fermé que si **tout** ce qui permet d'y entrer
+//! désigne l'un de ces trois comptes : chaque entrée d'autorisation, et le
+//! propriétaire, qui peut toujours réécrire la liste d'accès. Chercher
+//! seulement les groupes larges ne suffirait pas : il est possible de créer le
+//! dossier avant l'installation et de s'y réserver une entrée nominative, qui
+//! ne ressemble à rien de suspect.
+//!
 //! Un répertoire qui existait déjà n'est jamais modifié d'office : il peut
 //! appartenir à un autre compte, et lui retirer ses droits casserait une
 //! installation qui fonctionne. Il est signalé, et `sidgate protect` le ferme
@@ -23,7 +32,7 @@
 //!
 //! 1. Toute mémoire rendue par le système — descripteur de sécurité, chaîne
 //!    SDDL, chaîne de SID — est libérée par `LocalFree` sur tous les chemins,
-//!    par le `Drop` de [`LocalMemory`].
+//!    par le `Drop` de `LocalMemory`.
 //! 2. Les pointeurs extraits d'un descripteur (`ACL`, `SID`) ne sont utilisés
 //!    que tant que le descripteur dont ils sont issus est vivant.
 
@@ -32,9 +41,9 @@ use std::path::Path;
 /// État du contrôle d'accès d'un répertoire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exposure {
-    /// Seuls le système, les administrateurs et des comptes nommés y accèdent.
+    /// Seuls le système, les administrateurs et le compte courant y accèdent.
     Private,
-    /// Un groupe large — tous les utilisateurs de la machine — y a accès.
+    /// Un autre compte, ou un groupe, y a accès ou en est propriétaire.
     Shared,
     /// L'état n'a pas pu être lu, ou la plateforme n'a pas cette notion.
     Unknown,
@@ -56,54 +65,85 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// Les trustees SDDL désignant un groupe auquel tout compte local appartient.
-const BROAD_TRUSTEES: &[&str] = &[
-    "WD", // Tout le monde
-    "S-1-1-0",
-    "AU", // Utilisateurs authentifiés
-    "S-1-5-11",
-    "BU", // Utilisateurs
-    "S-1-5-32-545",
-    "IU", // Utilisateurs interactifs
-    "S-1-5-4",
-    "BG", // Invités
-    "S-1-5-32-546",
-    "AN", // Anonyme
-    "S-1-5-7",
-];
-
-/// La liste d'accès décrite en SDDL accorde-t-elle quelque chose à un groupe
-/// large ?
+/// Système et administrateurs, en notation SDDL.
+const SYSTEM: &str = "SY";
+const ADMINISTRATORS: &str = "BA";
+/// Pseudo-comptes « créateur propriétaire » et « droits du propriétaire ».
 ///
-/// Seules les entrées d'autorisation comptent : un refus adressé à tout le
-/// monde ne donne accès à personne.
-pub fn grants_broad_access(sddl: &str) -> bool {
-    let Some(dacl) = sddl.split("D:").nth(1) else {
-        // Pas de liste d'accès du tout : le système accorde alors tout à tous.
-        return true;
+/// Ils ne désignent personne par eux-mêmes : ils renvoient au propriétaire de
+/// l'objet, qui est vérifié à part.
+const OWNER_PLACEHOLDERS: &[&str] = &["CO", "OW"];
+
+/// Découpe un descripteur SDDL en sections `(étiquette, contenu)`.
+///
+/// Les sections se suivent sans séparateur — `O:…G:…D:…S:…` — mais ni un SID ni
+/// une entrée de liste ne contient de deux-points : chacun marque donc une
+/// étiquette, portée par le caractère qui le précède.
+fn sections(sddl: &str) -> Vec<(char, &str)> {
+    let colons: Vec<usize> = sddl.match_indices(':').map(|(index, _)| index).collect();
+    colons
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &colon)| {
+            let tag = sddl[..colon].chars().next_back()?;
+            let end = colons
+                .get(position + 1)
+                .map_or(sddl.len(), |next| next.saturating_sub(1));
+            Some((tag, sddl.get(colon + 1..end.max(colon + 1))?))
+        })
+        .collect()
+}
+
+/// Le descripteur réserve-t-il l'objet au système, aux administrateurs et à
+/// `account` ?
+///
+/// `account` est le compte courant, dans la notation que le système emploie
+/// lui-même pour ce descripteur. Seules les entrées d'autorisation comptent :
+/// un refus ne donne accès à personne.
+pub fn is_reserved_to(sddl: &str, account: &str) -> bool {
+    let sections = sections(sddl);
+    let section = |tag| {
+        sections
+            .iter()
+            .find(|(found, _)| *found == tag)
+            .map(|(_, content)| *content)
     };
-    // La liste s'arrête à la section suivante, s'il y en a une.
-    let dacl = dacl.split("S:").next().unwrap_or(dacl);
+    let trusted = |trustee: &str| [SYSTEM, ADMINISTRATORS, account].contains(&trustee);
+
+    // Le propriétaire peut toujours réécrire la liste d'accès : s'il n'est pas
+    // de confiance, ce qu'elle dit aujourd'hui ne vaut rien demain.
+    if !section('O').is_some_and(trusted) {
+        return false;
+    }
+    // Sans liste d'accès, ou avec une liste « nulle », le système accorde tout
+    // à tous.
+    let Some(dacl) = section('D') else {
+        return false;
+    };
+    if dacl.contains("NO_ACCESS_CONTROL") {
+        return false;
+    }
 
     dacl.split('(')
         .skip(1)
         .filter_map(|ace| ace.split(')').next())
-        .any(|ace| {
+        .all(|ace| {
             let fields: Vec<&str> = ace.split(';').collect();
             // Autorisation simple, sur objet, ou conditionnelle. Les entrées
-            // d'audit (`AU`) et d'alarme (`AL`) commencent aussi par un A.
+            // de refus, d'audit et d'alarme n'ouvrent rien.
             let allows = matches!(fields.first().copied(), Some("A" | "OA" | "XA" | "ZA"));
             let trustee = fields.get(5).copied().unwrap_or_default();
-            allows && BROAD_TRUSTEES.contains(&trustee)
+            !allows || trusted(trustee) || OWNER_PLACEHOLDERS.contains(&trustee)
         })
 }
 
-/// Liste d'accès appliquée à un répertoire fermé, pour le compte `user_sid`.
+/// Descripteur appliqué à un répertoire fermé, pour le compte `user_sid`.
 ///
-/// `P` : protégée, plus d'héritage du parent. `OICI` : les entrées se
-/// propagent aux fichiers et aux sous-dossiers. `FA` : accès complet.
+/// `O:` en fait le propriétaire. `P` : liste protégée, plus d'héritage du
+/// parent. `OICI` : les entrées se propagent aux fichiers et aux sous-dossiers.
+/// `FA` : accès complet.
 pub fn private_sddl(user_sid: &str) -> String {
-    format!("D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user_sid})")
+    format!("O:{user_sid}D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user_sid})")
 }
 
 #[cfg(windows)]
@@ -132,12 +172,13 @@ mod windows_impl {
         SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows::Win32::Security::{
-        GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation, TokenUser, ACL,
+        DACL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    use super::{grants_broad_access, private_sddl, Exposure};
+    use super::{is_reserved_to, private_sddl, Exposure};
 
     /// Bloc alloué par le système, à rendre par `LocalFree`.
     struct LocalMemory(*mut core::ffi::c_void);
@@ -152,6 +193,80 @@ mod windows_impl {
         }
     }
 
+    /// Descripteur de sécurité construit à partir de sa forme SDDL.
+    struct Descriptor {
+        raw: PSECURITY_DESCRIPTOR,
+        _memory: LocalMemory,
+    }
+
+    impl Descriptor {
+        fn parse(sddl: &str) -> anyhow::Result<Self> {
+            let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut raw = PSECURITY_DESCRIPTOR::default();
+            // SAFETY: `wide` est terminée par un zéro ; `raw` est un local
+            // vivant, rempli par l'appel et libéré par `_memory`.
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(wide.as_ptr()),
+                    SDDL_REVISION_1,
+                    &mut raw,
+                    None,
+                )
+            }?;
+            Ok(Self {
+                raw,
+                _memory: LocalMemory(raw.0),
+            })
+        }
+
+        /// Liste d'accès du descripteur. Le pointeur vit autant que `self`.
+        fn dacl(&self) -> anyhow::Result<*mut ACL> {
+            let mut present = windows::core::BOOL::default();
+            let mut defaulted = windows::core::BOOL::default();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            // SAFETY: le descripteur est vivant ; les trois sorties sont des
+            // locaux.
+            unsafe {
+                GetSecurityDescriptorDacl(self.raw, &mut present, &mut dacl, &mut defaulted)
+            }?;
+            anyhow::ensure!(present.as_bool() && !dacl.is_null(), "liste d'accès vide");
+            Ok(dacl)
+        }
+
+        /// Propriétaire du descripteur. Le pointeur vit autant que `self`.
+        fn owner(&self) -> anyhow::Result<PSID> {
+            let mut defaulted = windows::core::BOOL::default();
+            let mut owner = PSID::default();
+            // SAFETY: le descripteur est vivant ; les sorties sont des locaux.
+            unsafe { GetSecurityDescriptorOwner(self.raw, &mut owner, &mut defaulted) }?;
+            anyhow::ensure!(!owner.0.is_null(), "descripteur sans propriétaire");
+            Ok(owner)
+        }
+    }
+
+    /// Rend un descripteur sous forme SDDL, pour les parties demandées.
+    fn sddl_of(
+        descriptor: PSECURITY_DESCRIPTOR,
+        parts: OBJECT_SECURITY_INFORMATION,
+    ) -> Option<String> {
+        let mut text = PWSTR::null();
+        // SAFETY: `descriptor` est vivant chez l'appelant ; `text` reçoit une
+        // chaîne allouée par le système, libérée par `_text_memory`.
+        unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                parts,
+                &mut text,
+                None,
+            )
+        }
+        .ok()?;
+        let _text_memory = LocalMemory(text.0.cast());
+        // SAFETY: chaîne terminée par un zéro, vivante jusqu'à sa libération.
+        unsafe { text.to_string() }.ok()
+    }
+
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str()
             .encode_wide()
@@ -159,69 +274,76 @@ mod windows_impl {
             .collect()
     }
 
-    /// Réduit l'accès au répertoire au système, aux administrateurs et au
-    /// compte courant.
-    pub fn restrict(path: &Path) -> anyhow::Result<()> {
-        let sddl: Vec<u16> = private_sddl(&current_user_sid()?)
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: `sddl` est terminée par un zéro ; `descriptor` est un local
-        // vivant, rempli par l'appel et libéré par `_descriptor_memory`.
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR(sddl.as_ptr()),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                None,
-            )
-        }?;
-        let _descriptor_memory = LocalMemory(descriptor.0);
-
-        let mut present = windows::core::BOOL::default();
-        let mut defaulted = windows::core::BOOL::default();
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        // SAFETY: `descriptor` est vivant ; les trois sorties sont des locaux.
-        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }?;
-        anyhow::ensure!(present.as_bool() && !dacl.is_null(), "liste d'accès vide");
-
+    /// Applique une liste d'accès protégée au répertoire, et son propriétaire
+    /// s'il est fourni. Renvoie `true` si le système l'a acceptée.
+    fn apply(path: &Path, dacl: *mut ACL, owner: Option<PSID>) -> bool {
+        let mut parts = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+        if owner.is_some() {
+            parts |= OWNER_SECURITY_INFORMATION;
+        }
         let name = wide(path);
-        // SAFETY: `name` est terminé par un zéro ; `dacl` pointe dans
-        // `descriptor`, vivant jusqu'à la fin de la fonction. L'appel copie la
-        // liste d'accès dans le descripteur du répertoire.
+        // SAFETY: `name` est terminé par un zéro ; `dacl` et `owner` pointent
+        // dans un descripteur que l'appelant garde vivant. L'appel copie ce
+        // qu'il reçoit dans le descripteur du répertoire.
         let status = unsafe {
             SetNamedSecurityInfoW(
                 PCWSTR(name.as_ptr()),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                None,
+                parts,
+                owner,
                 None,
                 Some(dacl),
                 None,
             )
         };
+        status == ERROR_SUCCESS
+    }
+
+    /// Réserve le répertoire au système, aux administrateurs et au compte
+    /// courant, qui en devient propriétaire.
+    ///
+    /// Échoue si le répertoire reste ouvert à un autre compte après coup —
+    /// typiquement parce qu'il appartient à quelqu'un d'autre et que l'appelant
+    /// n'a pas le droit d'en changer le propriétaire.
+    pub fn restrict(path: &Path) -> anyhow::Result<()> {
+        let descriptor = Descriptor::parse(&private_sddl(&current_user_sid()?))?;
+        let dacl = descriptor.dacl()?;
+        let owner = descriptor.owner()?;
+
+        // La propriété d'abord, avec la liste : c'est elle qui empêche l'ancien
+        // propriétaire de se rouvrir la porte. Un compte déjà propriétaire, ou
+        // sans le droit d'en changer, se contente de la liste.
+        if !apply(path, dacl, Some(owner)) {
+            anyhow::ensure!(
+                apply(path, dacl, None),
+                "modification du contrôle d'accès refusée"
+            );
+        }
+
         anyhow::ensure!(
-            status == ERROR_SUCCESS,
-            "modification du contrôle d'accès refusée (erreur {})",
-            status.0
+            exposure(path) != Exposure::Shared,
+            "le répertoire appartient à un autre compte ; relancez depuis une invite \
+             administrateur pour en reprendre la propriété"
         );
         Ok(())
     }
 
-    /// Lit le contrôle d'accès du répertoire et dit s'il est ouvert à un
-    /// groupe large.
+    /// Lit le contrôle d'accès du répertoire et dit s'il est réservé au
+    /// système, aux administrateurs et au compte courant.
     pub fn exposure(path: &Path) -> Exposure {
-        match read_sddl(path) {
-            Some(sddl) if grants_broad_access(&sddl) => Exposure::Shared,
-            Some(_) => Exposure::Private,
-            None => Exposure::Unknown,
+        let (Some(sddl), Some(account)) = (read_sddl(path), current_account()) else {
+            return Exposure::Unknown;
+        };
+        if is_reserved_to(&sddl, &account) {
+            Exposure::Private
+        } else {
+            Exposure::Shared
         }
     }
 
-    /// Liste d'accès du répertoire, en SDDL.
+    /// Propriétaire et liste d'accès du répertoire, en SDDL.
     fn read_sddl(path: &Path) -> Option<String> {
+        let parts = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
         let name = wide(path);
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         // SAFETY: `name` est terminé par un zéro ; seul le descripteur complet
@@ -230,7 +352,7 @@ mod windows_impl {
             GetNamedSecurityInfoW(
                 PCWSTR(name.as_ptr()),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
+                parts,
                 None,
                 None,
                 None,
@@ -242,24 +364,20 @@ mod windows_impl {
             return None;
         }
         let _descriptor_memory = LocalMemory(descriptor.0);
+        sddl_of(descriptor, parts)
+    }
 
-        let mut text = PWSTR::null();
-        // SAFETY: `descriptor` est vivant ; `text` reçoit une chaîne allouée
-        // par le système, libérée par `_text_memory`.
-        unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                descriptor,
-                SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
-                &mut text,
-                None,
-            )
-        }
-        .ok()?;
-        let _text_memory = LocalMemory(text.0.cast());
-        // SAFETY: `text` est une chaîne terminée par un zéro, vivante jusqu'à
-        // la libération ci-dessus.
-        unsafe { text.to_string() }.ok()
+    /// Le compte courant, tel que le système l'écrit dans un descripteur.
+    ///
+    /// Un compte connu du système y figure sous un alias de deux lettres plutôt
+    /// que sous son SID. Pour comparer sans tenir à jour une table d'alias, on
+    /// demande au système d'écrire lui-même un descripteur dont ce compte est
+    /// propriétaire.
+    fn current_account() -> Option<String> {
+        let sid = current_user_sid().ok()?;
+        let descriptor = Descriptor::parse(&format!("O:{sid}")).ok()?;
+        let sddl = sddl_of(descriptor.raw, OWNER_SECURITY_INFORMATION)?;
+        Some(sddl.strip_prefix("O:")?.to_string())
     }
 
     /// SID du compte sous lequel tourne le processus, en notation textuelle.
@@ -325,6 +443,7 @@ mod windows_impl {
         fn the_current_account_has_a_well_formed_sid() {
             let sid = current_user_sid().unwrap();
             assert!(sid.starts_with("S-1-"), "{sid}");
+            assert!(!current_account().unwrap().is_empty());
         }
 
         #[test]
@@ -359,6 +478,7 @@ mod windows_impl {
             restrict(&dir).unwrap();
 
             let sddl = read_sddl(&dir).unwrap();
+            let account = current_account().unwrap();
             assert!(sddl.contains("D:P"), "la liste doit être protégée: {sddl}");
             assert!(sddl.contains(";;;SY)"), "{sddl}");
             assert!(sddl.contains(";;;BA)"), "{sddl}");
@@ -367,7 +487,28 @@ mod windows_impl {
                 3,
                 "trois entrées, pas une de plus: {sddl}"
             );
-            assert!(!grants_broad_access(&sddl));
+            assert!(is_reserved_to(&sddl, &account), "{sddl} pour {account}");
+            assert_eq!(exposure(&dir), Exposure::Private);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_directory_opened_to_everyone_is_detected_then_closed_again() {
+            let dir = temp_dir("open");
+            std::fs::create_dir_all(&dir).unwrap();
+            restrict(&dir).unwrap();
+
+            // Rouvre le répertoire à tous, comme le ferait un héritage laxiste.
+            let sid = current_user_sid().unwrap();
+            let open = Descriptor::parse(&format!(
+                "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{sid})(A;OICI;FR;;;WD)"
+            ))
+            .unwrap();
+            assert!(apply(&dir, open.dacl().unwrap(), None));
+            assert_eq!(exposure(&dir), Exposure::Shared);
+
+            restrict(&dir).unwrap();
+            assert_eq!(exposure(&dir), Exposure::Private);
             std::fs::remove_dir_all(&dir).unwrap();
         }
 
@@ -382,55 +523,116 @@ mod windows_impl {
 mod tests {
     use super::*;
 
+    /// Un compte ordinaire, tel qu'il apparaît dans un descripteur.
+    const ME: &str = "S-1-5-21-1-2-3-1001";
+    const OTHER: &str = "S-1-5-21-1-2-3-1002";
+
     #[test]
-    fn the_private_list_grants_nothing_to_broad_groups() {
-        let sddl = private_sddl("S-1-5-21-1-2-3-1001");
-        assert!(!grants_broad_access(&sddl));
+    fn sections_are_split_on_their_tags() {
+        assert_eq!(
+            sections("O:BAG:SYD:PAI(A;;FA;;;SY)S:(AU;SAFA;FA;;;WD)"),
+            vec![
+                ('O', "BA"),
+                ('G', "SY"),
+                ('D', "PAI(A;;FA;;;SY)"),
+                ('S', "(AU;SAFA;FA;;;WD)"),
+            ]
+        );
+        assert_eq!(sections("D:"), vec![('D', "")]);
+        assert!(sections("").is_empty());
+    }
+
+    #[test]
+    fn the_descriptor_we_apply_is_reserved_to_its_account() {
+        assert!(is_reserved_to(&private_sddl(ME), ME));
         assert!(
-            sddl.starts_with("D:P"),
+            private_sddl(ME).contains("D:P"),
             "sans protection, l'héritage reviendrait"
         );
     }
 
     #[test]
-    fn inherited_program_data_permissions_are_recognised_as_shared() {
+    fn inherited_program_data_permissions_are_not_private() {
         // Ce que reçoit un dossier créé sous %PROGRAMDATA% sans précaution.
-        let inherited = "D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIIOID;GA;;;CO)\
-                         (A;OICIID;0x1200a9;;;BU)(A;CIID;DCLCRPCR;;;BU)";
-        assert!(grants_broad_access(inherited));
+        let inherited = format!(
+            "O:{ME}D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIIOID;GA;;;CO)\
+             (A;OICIID;0x1200a9;;;BU)(A;CIID;DCLCRPCR;;;BU)"
+        );
+        assert!(!is_reserved_to(&inherited, ME));
     }
 
     #[test]
-    fn every_broad_trustee_is_detected_in_alias_and_numeric_form() {
-        for trustee in BROAD_TRUSTEES {
-            let sddl = format!("D:P(A;OICI;FA;;;SY)(A;;FR;;;{trustee})");
-            assert!(grants_broad_access(&sddl), "{trustee}");
+    fn every_broad_group_opens_the_directory() {
+        for trustee in ["WD", "AU", "BU", "IU", "BG", "AN", "S-1-1-0", "S-1-5-11"] {
+            let sddl = format!("O:{ME}D:P(A;OICI;FA;;;SY)(A;;FR;;;{trustee})");
+            assert!(!is_reserved_to(&sddl, ME), "{trustee}");
         }
     }
 
     #[test]
+    fn a_named_entry_for_another_account_is_not_private() {
+        // Le dossier créé d'avance par un autre compte du poste, qui s'y est
+        // réservé une entrée : aucun groupe large, et pourtant ouvert.
+        let sddl = format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{OTHER})");
+        assert!(!is_reserved_to(&sddl, ME));
+        assert!(
+            is_reserved_to(&sddl, OTHER),
+            "pour lui, en revanche, il l'est"
+        );
+    }
+
+    #[test]
+    fn a_foreign_owner_is_not_private_whatever_the_list_says() {
+        let sddl = format!("O:{OTHER}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{ME})");
+        assert!(
+            !is_reserved_to(&sddl, ME),
+            "le propriétaire peut réécrire la liste quand il veut"
+        );
+    }
+
+    #[test]
+    fn system_or_administrators_may_own_the_directory() {
+        for owner in ["SY", "BA", ME] {
+            let sddl = format!("O:{owner}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+            assert!(is_reserved_to(&sddl, ME), "{owner}");
+        }
+    }
+
+    #[test]
+    fn a_missing_owner_is_not_taken_on_trust() {
+        assert!(!is_reserved_to("D:P(A;OICI;FA;;;SY)", ME));
+    }
+
+    #[test]
     fn a_denial_addressed_to_everyone_grants_nothing() {
-        assert!(!grants_broad_access("D:P(D;;FA;;;WD)(A;OICI;FA;;;SY)"));
+        let sddl = format!("O:{ME}D:P(D;;FA;;;WD)(A;OICI;FA;;;SY)");
+        assert!(is_reserved_to(&sddl, ME));
     }
 
     #[test]
-    fn a_named_account_is_not_a_broad_group() {
-        assert!(!grants_broad_access(
-            "O:BAG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)"
-        ));
+    fn owner_placeholders_are_harmless_once_the_owner_is_trusted() {
+        let sddl = format!("O:{ME}D:P(A;OICI;FA;;;SY)(A;OICIIO;GA;;;CO)(A;;FA;;;OW)");
+        assert!(is_reserved_to(&sddl, ME));
     }
 
     #[test]
-    fn a_descriptor_without_an_access_list_is_wide_open() {
-        assert!(grants_broad_access("O:BAG:SY"));
+    fn a_missing_or_null_access_list_is_wide_open() {
+        assert!(!is_reserved_to(&format!("O:{ME}G:SY"), ME));
+        assert!(!is_reserved_to(&format!("O:{ME}D:NO_ACCESS_CONTROL"), ME));
+    }
+
+    #[test]
+    fn an_empty_access_list_admits_nobody() {
+        // Liste présente mais vide : personne n'entre, pas même nous. Ce n'est
+        // pas utilisable, mais ce n'est pas exposé.
+        assert!(is_reserved_to(&format!("O:{ME}D:P"), ME));
     }
 
     #[test]
     fn a_trailing_audit_list_is_not_read_as_access() {
         // La section d'audit suit la liste d'accès et nomme volontiers « tout
         // le monde » : ce n'est pas un droit.
-        assert!(!grants_broad_access(
-            "D:P(A;OICI;FA;;;SY)S:(AU;SAFA;FA;;;WD)"
-        ));
+        let sddl = format!("O:{ME}D:P(A;OICI;FA;;;SY)S:(AU;SAFA;FA;;;WD)");
+        assert!(is_reserved_to(&sddl, ME));
     }
 }

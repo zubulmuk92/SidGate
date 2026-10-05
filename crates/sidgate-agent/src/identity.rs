@@ -49,6 +49,15 @@ const KEY_FILE: &str = "agent.key";
 const CLIENTS_FILE: &str = "clients.json";
 /// Nom du fichier portant une demande d'appairage déposée par `sidgate pair`.
 const TICKET_FILE: &str = "pairing.json";
+/// Nom du fichier servant de verrou aux écritures du registre.
+const LOCK_FILE: &str = "clients.lock";
+/// Durée de vie maximale d'une demande d'appairage, en secondes.
+///
+/// Une demande dont l'échéance est plus lointaine n'a pas pu être écrite par
+/// `sidgate pair`, que la configuration borne à cette durée : elle est refusée,
+/// pour qu'un fichier déposé un jour par quelqu'un qui avait accès au
+/// répertoire ne reste pas valable indéfiniment.
+pub const MAX_PAIRING_WINDOW_SECS: u64 = 3600;
 
 /// Alphabet du code d'appairage.
 ///
@@ -114,6 +123,7 @@ pub struct Identity {
     clients_path: PathBuf,
     clients_stamp: FileStamp,
     ticket_path: PathBuf,
+    lock_path: PathBuf,
     pairing: Option<PairingWindow>,
     attempts: HashMap<IpAddr, AttemptWindow>,
     attempts_per_minute: u32,
@@ -170,6 +180,7 @@ impl Identity {
             clients_path,
             clients_stamp,
             ticket_path: dir.join(TICKET_FILE),
+            lock_path: dir.join(LOCK_FILE),
             pairing: None,
             attempts: HashMap::new(),
             attempts_per_minute,
@@ -200,6 +211,8 @@ impl Identity {
 
     /// Retire un client. Renvoie `true` s'il existait.
     pub fn revoke(&mut self, key_hex: &str) -> anyhow::Result<bool> {
+        let _lock = RegistryLock::acquire(&self.lock_path);
+        self.refresh_clients();
         let before = self.clients.len();
         self.clients.retain(|c| c.key != key_hex);
         let removed = self.clients.len() != before;
@@ -311,10 +324,15 @@ impl Identity {
             signaling::client_auth_transcript(server_nonce, client_nonce, &client_key.1);
         verify_client_signature(&client_key.0, &transcript, signature_hex)?;
 
-        let now = unix_now();
-        if let Some(client) = self.clients.iter_mut().find(|c| c.key == client_key_hex) {
-            client.last_seen = Some(now);
-        }
+        // Dater la visite réécrit le registre. Sous verrou, et depuis une
+        // lecture fraîche : sans cela, une révocation faite à l'instant par
+        // une autre invite serait écrasée par notre copie d'avant.
+        let _lock = RegistryLock::acquire(&self.lock_path);
+        self.refresh_clients();
+        let Some(client) = self.clients.iter_mut().find(|c| c.key == client_key_hex) else {
+            return Err(AuthError::Rejected);
+        };
+        client.last_seen = Some(unix_now());
         let _ = self.persist_clients();
         self.attempts.remove(&source);
         Ok(client_key_hex.to_string())
@@ -360,25 +378,32 @@ impl Identity {
             signaling::client_pair_transcript(server_nonce, client_nonce, &client_key.1);
         verify_client_signature(&client_key.0, &transcript, signature_hex)?;
 
+        self.attempts.remove(&source);
+
+        {
+            let _lock = RegistryLock::acquire(&self.lock_path);
+            self.refresh_clients();
+            let now = unix_now();
+            self.clients.retain(|c| c.key != client_key_hex);
+            self.clients.push(PairedClient {
+                key: client_key_hex.to_string(),
+                label: sanitize_label(label),
+                paired_at: now,
+                last_seen: Some(now),
+            });
+            let _ = self.persist_clients();
+        }
+
         // Le code n'est valable qu'une fois : le conserver ouvert après un
         // appairage réussi laisserait une seconde fenêtre à quiconque l'a vu.
+        // La demande n'est retirée qu'une fois le client inscrit : `sidgate
+        // pair` lit sa disparition comme « c'est fait ».
         if from_console {
             self.pairing = None;
         }
         if from_ticket {
             let _ = std::fs::remove_file(&self.ticket_path);
         }
-        self.attempts.remove(&source);
-
-        let now = unix_now();
-        self.clients.retain(|c| c.key != client_key_hex);
-        self.clients.push(PairedClient {
-            key: client_key_hex.to_string(),
-            label: sanitize_label(label),
-            paired_at: now,
-            last_seen: Some(now),
-        });
-        let _ = self.persist_clients();
         tracing::warn!(%source, label = %sanitize_label(label), "nouveau client appairé");
         Ok(client_key_hex.to_string())
     }
@@ -447,13 +472,60 @@ pub fn pairing_ticket_pending(dir: &Path) -> bool {
 /// rester sur le disque à attendre qu'une horloge reculée la ressuscite.
 fn read_ticket(path: &Path) -> Option<PairingTicket> {
     let bytes = std::fs::read(path).ok()?;
+    let now = unix_now();
     let ticket = serde_json::from_slice::<PairingTicket>(&bytes)
         .ok()
-        .filter(|ticket| unix_now() < ticket.expires_at);
+        .filter(|ticket| (now + 1..=now + MAX_PAIRING_WINDOW_SECS).contains(&ticket.expires_at));
     if ticket.is_none() {
         let _ = std::fs::remove_file(path);
     }
     ticket
+}
+
+/// Exclusion entre processus pour un cycle lecture, modification, écriture du
+/// registre.
+///
+/// L'agent et les commandes `revoke` et `pair` réécrivent le même fichier.
+/// Sans exclusion, chacun pourrait écrire une liste lue avant la modification
+/// de l'autre, et une révocation disparaître. Le verrou est un fichier ouvert
+/// sans partage : le système le relâche de lui-même si le processus meurt.
+struct RegistryLock(#[allow(dead_code)] Option<std::fs::File>);
+
+impl RegistryLock {
+    /// Attend le verrou une demi-seconde au plus.
+    ///
+    /// Passé ce délai, l'opération se poursuit sans lui : un verrou resté pris
+    /// ne doit pas empêcher de révoquer un client.
+    fn acquire(path: &Path) -> Self {
+        for _ in 0..50 {
+            if let Ok(file) = open_exclusive(path) {
+                return Self(Some(file));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tracing::warn!(path = %path.display(), "verrou du registre indisponible, écriture sans lui");
+        Self(None)
+    }
+}
+
+#[cfg(windows)]
+fn open_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
 }
 
 /// Date de modification et taille d'un fichier, ou `None` s'il n'existe pas.
@@ -566,8 +638,10 @@ fn generate_pairing_code() -> anyhow::Result<String> {
 /// fichier à moitié écrit. La confidentialité, elle, vient du répertoire, fermé
 /// aux autres comptes à sa création.
 fn write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    // Nom de transit propre au processus : deux écrivains ne se marchent pas
+    // dessus, même sans verrou.
     let mut staging = path.as_os_str().to_owned();
-    staging.push(".tmp");
+    staging.push(format!(".{}.tmp", std::process::id()));
     let staging = PathBuf::from(staging);
     std::fs::write(&staging, contents)?;
     if let Err(e) = std::fs::rename(&staging, path) {
@@ -998,6 +1072,70 @@ mod tests {
     }
 
     #[test]
+    fn a_ticket_valid_for_too_long_is_refused_and_erased() {
+        // Déposé à la main avec une échéance dans dix ans : `sidgate pair` ne
+        // sait pas écrire cela.
+        let dir = temp_dir("ticket-eternal");
+        let mut identity = Identity::load_or_create(&dir, 100).unwrap();
+        let ticket = PairingTicket {
+            code: "ABCD-EFGH".into(),
+            expires_at: unix_now() + 10 * 365 * 24 * 3600,
+        };
+        std::fs::write(dir.join(TICKET_FILE), serde_json::to_vec(&ticket).unwrap()).unwrap();
+
+        assert!(!identity.pairing_open());
+        assert!(!dir.join(TICKET_FILE).exists());
+        assert_eq!(
+            pair_with_code(&mut identity, &TestClient::new(), "ABCD-EFGH"),
+            Err(AuthError::PairingClosed)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_registry_lock_excludes_a_second_holder() {
+        let dir = temp_dir("lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LOCK_FILE);
+
+        let held = RegistryLock::acquire(&path);
+        assert!(held.0.is_some());
+        #[cfg(windows)]
+        assert!(
+            open_exclusive(&path).is_err(),
+            "le verrou doit refuser un second détenteur"
+        );
+        drop(held);
+        assert!(
+            open_exclusive(&path).is_ok(),
+            "et se libérer avec le premier"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_client_revoked_between_two_reads_is_refused() {
+        // L'agent a relu le registre, puis une autre invite révoque : la
+        // connexion en cours de vérification ne doit ni aboutir ni réinscrire
+        // le client en datant sa visite.
+        let dir = temp_dir("revoke-race");
+        let mut agent = Identity::load_or_create(&dir, 100).unwrap();
+        let client = TestClient::new();
+        pair_client(&mut agent, &client).unwrap();
+        agent.refresh_clients();
+
+        let mut cli = Identity::load_or_create(&dir, 100).unwrap();
+        cli.revoke(&client.key_hex).unwrap();
+
+        assert_eq!(authenticate(&mut agent, &client), Err(AuthError::Rejected));
+        assert!(Identity::load_or_create(&dir, 100)
+            .unwrap()
+            .clients()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_malformed_ticket_opens_nothing() {
         let dir = temp_dir("ticket-garbage");
         let identity = Identity::load_or_create(&dir, 100).unwrap();
@@ -1097,10 +1235,8 @@ mod tests {
         write_private(&path, b"premier").unwrap();
         write_private(&path, b"second").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
-        assert!(
-            !dir.join("secret.tmp").exists(),
-            "aucun fichier de transit ne doit rester"
-        );
+        let leftovers = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(leftovers, 1, "aucun fichier de transit ne doit rester");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

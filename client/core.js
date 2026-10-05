@@ -162,6 +162,38 @@ export function chunk(items, size) {
   return out;
 }
 
+/**
+ * Boutons du protocole, dans l'ordre des bits de `PointerEvent.buttons`.
+ *
+ * Le navigateur numérote gauche, droit, milieu ; `PointerEvent.button`, lui,
+ * numérote gauche, milieu, droit. C'est le masque qui sert ici.
+ */
+const BUTTON_BITS = [[1, 0], [2, 1], [4, 2], [8, 3], [16, 4]];
+
+/**
+ * Compare les boutons enfoncés selon le navigateur à ceux tenus sur l'hôte.
+ *
+ * Un navigateur ne signale par `pointerdown` que le premier bouton enfoncé, et
+ * par `pointerup` que le dernier relâché : entre les deux, un autre bouton
+ * pressé ou relâché n'arrive que comme un mouvement dont le masque a changé.
+ * Se fier au masque à chaque événement est la seule façon de ne pas laisser un
+ * bouton enfoncé sur l'hôte.
+ *
+ * @param {number} mask  `PointerEvent.buttons`.
+ * @param {Set<number>} held  Boutons du protocole tenus sur l'hôte.
+ * @returns {{press: number[], release: number[]}}
+ */
+export function buttonDelta(mask, held) {
+  const press = [];
+  const release = [];
+  for (const [bit, index] of BUTTON_BITS) {
+    const down = (mask & bit) !== 0;
+    if (down && !held.has(index)) press.push(index);
+    if (!down && held.has(index)) release.push(index);
+  }
+  return { press, release };
+}
+
 /** Scancodes des touches que le texte tapé emprunte plutôt qu'un caractère. */
 const SCANCODE_ENTER = 0x1c;
 const SCANCODE_TAB = 0x0f;
