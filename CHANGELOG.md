@@ -34,6 +34,21 @@ la poignée de main et invité à recharger.
 - **Une image isolée arrivait avec un dixième de seconde de retard.** Une fois
   soumise à l'encodeur, sa sortie n'était relevée qu'à l'image suivante du
   bureau : sur un écran par ailleurs immobile, l'écho d'une frappe attendait.
+- **Un clic pouvait partir dans le coin de l'écran de l'hôte.** Quand la zone
+  vidéo du client ne mesurait rien — page masquée, mise en page pas encore
+  faite — la position calculée n'était pas un nombre, et passait le test
+  censé écarter les positions hors image.
+- **Le débit affiché comptait des octets jamais envoyés.** En débit constant,
+  l'encodeur complète chaque image par du remplissage : jusqu'à neuf dixièmes
+  de sa sortie sur un bureau calme. Il est retiré dès la sortie de l'encodeur,
+  et le débit affiché est celui qui part réellement sur le réseau.
+- **Le débit réel pouvait atteindre le double du palier choisi.** Certains
+  encodeurs ignorent la cadence qu'on leur déclare et répartissent le débit
+  sur trente images par seconde ; mesuré sur un encodeur AMD. L'agent déduit
+  de la taille des images la cadence supposée et corrige le débit qu'il
+  demande.
+- **Soixante images par seconde en donnaient cinquante-six.** Chaque
+  intervalle s'allongeait du temps d'encodage.
 - **Deux boutons de souris pressés ensemble en laissaient un enfoncé.** Le
   navigateur ne signale que le premier appui et le dernier relâchement ; les
   boutons se lisent maintenant dans le masque de chaque événement.

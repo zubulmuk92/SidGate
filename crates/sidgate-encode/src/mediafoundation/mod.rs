@@ -32,6 +32,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::VARIANT;
 
+use crate::bitstream::{strip_filler, RateCalibration};
 use crate::{EncodeError, EncodedFrame, EncoderConfig};
 
 use converter::Nv12Converter;
@@ -67,6 +68,10 @@ pub struct MediaFoundationEncoder {
     config: EncoderConfig,
     frame_duration_hns: u64,
     scratch: Vec<u8>,
+    /// Train binaire débarrassé de son remplissage.
+    stripped: Vec<u8>,
+    /// Cadence que l'encodeur suppose, déduite de la taille de ses images.
+    calibration: RateCalibration,
     timings: EncoderTimings,
 }
 
@@ -85,6 +90,8 @@ pub struct EncoderTimings {
     pub process: Duration,
     /// Nombre d'images comptabilisées.
     pub frames: u64,
+    /// Octets de remplissage retirés du train binaire.
+    pub padding: u64,
 }
 
 impl std::fmt::Debug for MediaFoundationEncoder {
@@ -164,6 +171,8 @@ impl MediaFoundationEncoder {
             config,
             frame_duration_hns: HNS_PER_SECOND / u64::from(config.framerate.max(1)),
             scratch: Vec::with_capacity(256 * 1024),
+            stripped: Vec::with_capacity(64 * 1024),
+            calibration: RateCalibration::new(config.framerate, config.bitrate),
             timings: EncoderTimings::default(),
         })
     }
@@ -258,15 +267,26 @@ impl MediaFoundationEncoder {
     /// Ajuste le débit cible en cours de session.
     pub fn set_bitrate(&mut self, bitrate: u32) {
         self.config.bitrate = bitrate;
+        self.apply_bitrate();
+    }
+
+    /// Donne à l'encodeur le débit qui produit réellement le débit voulu.
+    ///
+    /// Les deux diffèrent quand l'encodeur répartit le débit sur une autre
+    /// cadence que celle déclarée : voir [`RateCalibration`].
+    fn apply_bitrate(&mut self) {
+        let target = self.config.bitrate;
+        let effective = (f64::from(target) * self.calibration.factor()).round() as u32;
+        self.calibration.restart(effective);
         let Some(codec_api) = &self.codec_api else {
             return;
         };
         // SAFETY: la valeur est copiée par l'appel.
         let result = unsafe {
-            codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate))
+            codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(effective))
         };
         match result {
-            Ok(()) => tracing::info!(bitrate, "débit cible ajusté"),
+            Ok(()) => tracing::info!(bitrate = target, effective, "débit cible ajusté"),
             Err(e) => tracing::debug!(error = %e, "débit non ajustable à chaud"),
         }
     }
@@ -384,14 +404,36 @@ impl MediaFoundationEncoder {
         // SAFETY: même échantillon, même garantie.
         let time_hns = unsafe { sample.GetSampleTime() }.unwrap_or(0).max(0) as u64;
 
+        // En débit constant l'encodeur complète chaque image jusqu'à son
+        // budget par du remplissage, qui n'a rien à faire sur le réseau.
+        let padding = strip_filler(&self.scratch, &mut self.stripped);
+        self.timings.padding += padding as u64;
+        if let Some(factor) = self
+            .calibration
+            .observe(self.scratch.len(), padding, keyframe)
+        {
+            tracing::warn!(
+                declared = self.config.framerate,
+                assumed = (f64::from(self.config.framerate) * factor).round() as u32,
+                "l'encodeur répartit le débit sur une autre cadence que celle déclarée, \
+                 débit corrigé"
+            );
+            self.apply_bitrate();
+        }
+        if self.stripped.is_empty() {
+            return Ok(None);
+        }
+
         // Le client peut se raccrocher au flux à tout moment : une image clé
         // doit toujours être précédée de ses paramètres de séquence.
-        let mut payload = Vec::with_capacity(self.scratch.len() + self.sequence_header.len());
-        if keyframe && !self.sequence_header.is_empty() && !starts_with_parameter_set(&self.scratch)
+        let mut payload = Vec::with_capacity(self.stripped.len() + self.sequence_header.len());
+        if keyframe
+            && !self.sequence_header.is_empty()
+            && !starts_with_parameter_set(&self.stripped)
         {
             payload.extend_from_slice(&self.sequence_header);
         }
-        payload.extend_from_slice(&self.scratch);
+        payload.extend_from_slice(&self.stripped);
 
         Ok(Some(EncodedFrame {
             data: Bytes::from(payload),

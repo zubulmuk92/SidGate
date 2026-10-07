@@ -18,7 +18,7 @@ import {
   toHex, fromHex, fromBase64, groupHex, transcript,
   event as input, encodeFrame, coalesce, chunk, textToEvents, textDelta, wheelUnits,
   buttonDelta,
-  decodePointer, SeqTracker, contentRect,
+  decodePointer, SeqTracker, contentRect, pointInRect,
   perUnitDelta, lossPercentDelta, estimateLatency, isStalled, reconnectDelay,
 } from '/core.js';
 
@@ -1166,11 +1166,7 @@ const wheelCarry = { x: 0, y: 0 };
 
 /** Position normalisée d'un événement dans l'image du bureau, ou `null` hors image. */
 function normalized(pointerEvent) {
-  const rect = videoContentRect();
-  const x = (pointerEvent.clientX - rect.x) / rect.width;
-  const y = (pointerEvent.clientY - rect.y) / rect.height;
-  if (x < 0 || x > 1 || y < 0 || y > 1) return null;
-  return { x, y };
+  return pointInRect(pointerEvent.clientX, pointerEvent.clientY, videoContentRect());
 }
 
 const pointerLocked = () => document.pointerLockElement === ui.video;

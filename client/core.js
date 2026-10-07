@@ -69,7 +69,14 @@ const KIND = {
   KEY: 0x05, TEXT: 0x06, KEY_CHAR: 0x07,
 };
 
-const clampInt = (value, min, max) => Math.min(max, Math.max(min, Math.round(value)));
+/**
+ * Arrondit et borne. Une valeur qui n'est pas un nombre devient zéro : écrite
+ * telle quelle dans une trame, elle y deviendrait zéro de toute façon, mais en
+ * silence. Les positions absolues, pour qui zéro est un endroit précis de
+ * l'écran, sont filtrées avant d'arriver ici — voir `pointInRect`.
+ */
+const clampInt = (value, min, max) =>
+  (Number.isFinite(value) ? Math.min(max, Math.max(min, Math.round(value))) : 0);
 
 function pair16(kind, a, b, signed) {
   const bytes = new Uint8Array(5);
@@ -335,6 +342,28 @@ export function contentRect(box, ratio, anchorY = 0.5) {
   }
   const width = box.height * ratio;
   return { x: box.x + (box.width - width) / 2, y: box.y, width, height: box.height };
+}
+
+/**
+ * Position d'un point dans un rectangle, normalisée sur `0..1`.
+ *
+ * Renvoie `null` hors du rectangle, et `null` aussi quand le rectangle n'a pas
+ * de surface : une page masquée ou pas encore mise en page mesure zéro pixel,
+ * la division donne alors « pas un nombre », et « pas un nombre » n'est ni
+ * inférieur à 0 ni supérieur à 1. Un test écrit dans ce sens le laisserait
+ * passer, et le clic partirait dans le coin de l'écran de l'hôte.
+ *
+ * @param {number} x
+ * @param {number} y
+ * @param {{x:number,y:number,width:number,height:number}} rect
+ * @returns {{x:number,y:number}|null}
+ */
+export function pointInRect(x, y, rect) {
+  const nx = (x - rect.x) / rect.width;
+  const ny = (y - rect.y) / rect.height;
+  // Écrit en positif : toute comparaison avec « pas un nombre » est fausse.
+  if (!(nx >= 0 && nx <= 1 && ny >= 0 && ny <= 1)) return null;
+  return { x: nx, y: ny };
 }
 
 // --- Latence ----------------------------------------------------------------

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import {
   PROTOCOL, toHex, fromHex, fromBase64, groupHex, transcript,
   event, isLossy, encodeFrame, coalesce, chunk, textToEvents, textDelta, wheelUnits,
-  decodePointer, SeqTracker, contentRect, buttonDelta,
+  decodePointer, SeqTracker, contentRect, pointInRect, buttonDelta,
   perUnitDelta, lossPercentDelta, estimateLatency, isStalled,
   reconnectDelay, RECONNECT_DELAYS_MS, MAX_EVENTS_PER_FRAME,
 } from '../core.js';
@@ -317,6 +317,31 @@ test('une image calée en haut ne laisse de bande qu’en bas', () => {
   // L'ancrage vertical ne joue pas quand les bandes sont sur les côtés.
   assert.deepEqual(contentRect({ x: 0, y: 0, width: 1000, height: 500 }, 1, 0),
     contentRect({ x: 0, y: 0, width: 1000, height: 500 }, 1, 0.5));
+});
+
+test('un point se normalise dans son rectangle', () => {
+  const rect = { x: 100, y: 50, width: 200, height: 100 };
+  assert.deepEqual(pointInRect(100, 50, rect), { x: 0, y: 0 });
+  assert.deepEqual(pointInRect(300, 150, rect), { x: 1, y: 1 });
+  assert.deepEqual(pointInRect(200, 100, rect), { x: 0.5, y: 0.5 });
+  assert.equal(pointInRect(99, 100, rect), null);
+  assert.equal(pointInRect(200, 151, rect), null);
+});
+
+test('un rectangle sans surface ne désigne aucun point', () => {
+  // Régression : page masquée, zone vidéo de zéro pixel. La division donnait
+  // « pas un nombre », le test « hors bornes » ne le voyait pas, et le clic
+  // partait en (0, 0) sur l'écran de l'hôte.
+  const empty = { x: 0, y: 0, width: 0, height: 0 };
+  assert.equal(pointInRect(0, 0, empty), null);
+  assert.equal(pointInRect(10, 10, empty), null);
+  assert.equal(pointInRect(10, 10, { x: 0, y: 0, width: 100, height: 0 }), null);
+  assert.equal(pointInRect(NaN, 10, { x: 0, y: 0, width: 100, height: 100 }), null);
+});
+
+test('une valeur qui n’est pas un nombre ne produit jamais une trame à son image', () => {
+  assert.deepEqual(event.moveRelative(NaN, 5), bytes(0x01, 0, 0, 5, 0));
+  assert.deepEqual(event.scroll(Infinity, -Infinity), bytes(0x04, 0, 0, 0, 0));
 });
 
 test('une géométrie dégénérée rend la boîte telle quelle', () => {

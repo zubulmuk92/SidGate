@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+pub mod bitstream;
 #[cfg(windows)]
 pub mod mediafoundation;
 

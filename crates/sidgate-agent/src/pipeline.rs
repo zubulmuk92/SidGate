@@ -418,7 +418,10 @@ fn run(
             let mark = Instant::now();
             match submit_within(&mut engine, start.elapsed(), &mut encoded, frame_interval) {
                 Ok(Submission::Accepted) => {
-                    last_submit = Instant::now();
+                    // Daté du début de la soumission, pas de sa fin : sinon
+                    // chaque intervalle s'allonge du temps d'encodage, et
+                    // soixante images par seconde en deviennent cinquante-six.
+                    last_submit = mark;
                     owed = false;
                     unsent = false;
                     in_flight += 1;

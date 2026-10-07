@@ -9,6 +9,10 @@
 //! mesure alors le débit maximal de l'ASIC, indépendamment de ce que le bureau
 //! veut bien présenter. C'est la mesure qui compte pour savoir si la machine
 //! tient 60 i/s.
+//!
+//! `BENCH_FPS` change la cadence déclarée à l'encodeur. La ligne « budget »
+//! montre s'il en tient compte : à débit égal, le budget par image doit être
+//! divisé par deux quand la cadence déclarée double.
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,7 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = EncoderConfig {
         width: desktop.width,
         height: desktop.height,
-        framerate: 60,
+        framerate: std::env::var("BENCH_FPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60),
         bitrate: 0,
     }
     .scale_bitrate_to_resolution(20_000_000);
@@ -121,6 +128,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             per(t.process),
             t.dropped
         );
+        // Le remplissage est retiré du flux écrit ; son volume dit quel budget
+        // l'encodeur s'accorde par image, donc quelle cadence il suppose.
+        if encoded > 0 {
+            println!(
+                "remplissage      : {:.2} Mbit/s retirés | budget {:.0} kbit/image",
+                t.padding as f64 * 8.0 / elapsed / 1e6,
+                (bytes + t.padding) as f64 * 8.0 / encoded as f64 / 1000.0
+            );
+        }
     }
     println!("écrit dans {path}");
     Ok(())
